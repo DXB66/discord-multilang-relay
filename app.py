@@ -24,11 +24,13 @@ DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
 
 ENFORCE_SOURCE_LANGUAGE = os.getenv("ENFORCE_SOURCE_LANGUAGE", "true").lower() in {"1", "true", "yes", "on"}
 DETECT_MIN_TEXT_LENGTH = int(os.getenv("DETECT_MIN_TEXT_LENGTH", "4"))
-MAX_CONCURRENT_RELAYS = max(1, int(os.getenv("MAX_CONCURRENT_RELAYS", "3")))
-TRANSLATE_RETRIES = max(0, int(os.getenv("TRANSLATE_RETRIES", "1")))
-TRANSLATE_RETRY_DELAY = float(os.getenv("TRANSLATE_RETRY_DELAY", "0.7"))
+MAX_CONCURRENT_RELAYS = max(1, int(os.getenv("MAX_CONCURRENT_RELAYS", "2")))
+TRANSLATE_RETRIES = max(0, int(os.getenv("TRANSLATE_RETRIES", "2")))
+TRANSLATE_RETRY_DELAY = float(os.getenv("TRANSLATE_RETRY_DELAY", "1.0"))
 STRICT_LATIN_MISMATCH_MIN_CHARS = max(1, int(os.getenv("STRICT_LATIN_MISMATCH_MIN_CHARS", "18")))
 STRICT_LATIN_MISMATCH_MIN_WORDS = max(1, int(os.getenv("STRICT_LATIN_MISMATCH_MIN_WORDS", "3")))
+NO_DROP_FALLBACK = os.getenv("NO_DROP_FALLBACK", "true").lower() in {"1", "true", "yes", "on"}
+FALLBACK_PREFIX_TEMPLATE = os.getenv("FALLBACK_PREFIX_TEMPLATE", "[{source}] ")
 
 
 if not BOT_TOKEN:
@@ -71,6 +73,17 @@ def is_retryable_translate_error(exc: Exception) -> bool:
         return any(marker in message for marker in retryable_markers)
 
     return False
+
+
+def build_no_drop_fallback_content(source_lang: str, original_text: str, attachment_links: list[str]) -> str:
+    parts: list[str] = []
+    cleaned = original_text.strip()
+    if cleaned:
+        prefix = FALLBACK_PREFIX_TEMPLATE.format(source=source_lang.lower())
+        parts.append(f"{prefix}{cleaned}")
+    if attachment_links:
+        parts.append("\n".join(attachment_links))
+    return "\n\n".join(part for part in parts if part).strip()
 
 
 class RelayBot(commands.Bot):
@@ -717,20 +730,33 @@ async def relay_to_target(
         log.warning("Linked channel %s was not found or is not a text channel", target["channel_id"])
         return
 
+    used_fallback = False
+
     try:
         translated_text = await bot.translate_text(original_text, source_lang, target["language_code"])
+        final_content = translated_text.strip()
     except Exception as exc:
-        log.exception(
-            "Failed to translate message from %s to %s in group %s: %s",
+        if not NO_DROP_FALLBACK:
+            log.exception(
+                "Failed to translate message from %s to %s in group %s: %s",
+                source_lang,
+                target["language_code"],
+                group_name,
+                exc,
+            )
+            return
+
+        used_fallback = True
+        final_content = build_no_drop_fallback_content(source_lang, original_text, attachment_links)
+        log.warning(
+            "Translation failed from %s to %s in group %s. Sending no-drop fallback instead. Error: %s",
             source_lang,
             target["language_code"],
             group_name,
             exc,
         )
-        return
 
-    final_content = translated_text.strip()
-    if attachment_links:
+    if not used_fallback and attachment_links:
         if final_content:
             final_content += "\n\n"
         final_content += "\n".join(attachment_links)
