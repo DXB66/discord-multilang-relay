@@ -500,6 +500,62 @@ async def test_translate(
     )
 
 
+async def relay_to_target(
+    message: discord.Message,
+    source_lang: str,
+    group_name: str,
+    target: aiosqlite.Row,
+    original_text: str,
+    attachment_links: list[str],
+    display_name: str,
+    avatar_url: str,
+) -> None:
+    if message.guild is None:
+        return
+
+    if target["channel_id"] == message.channel.id:
+        return
+
+    target_channel = message.guild.get_channel(target["channel_id"])
+    if not isinstance(target_channel, discord.TextChannel):
+        log.warning("Linked channel %s was not found or is not a text channel", target["channel_id"])
+        return
+
+    try:
+        translated_text = await bot.translate_text(original_text, source_lang, target["language_code"])
+    except Exception as exc:
+        log.exception(
+            "Failed to translate message from %s to %s in group %s: %s",
+            source_lang,
+            target["language_code"],
+            group_name,
+            exc,
+        )
+        return
+
+    final_content = translated_text.strip()
+    if attachment_links:
+        if final_content:
+            final_content += "\n\n"
+        final_content += "\n".join(attachment_links)
+
+    if not final_content:
+        return
+
+    try:
+        webhook = await bot.get_or_create_webhook(target_channel, message.guild.id)
+        await webhook.send(
+            content=final_content,
+            username=display_name[:80],
+            avatar_url=avatar_url,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.Forbidden:
+        log.exception("Missing permission to create or use webhooks in #%s", target_channel.name)
+    except Exception:
+        log.exception("Failed to relay message into #%s", target_channel.name)
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if message.guild is None:
@@ -524,53 +580,27 @@ async def on_message(message: discord.Message) -> None:
 
     source_lang = row["language_code"]
     original_text = message.content or ""
-
     attachment_links = [a.url for a in message.attachments]
     display_name = message.author.display_name
     avatar_url = message.author.display_avatar.url
 
-    for target in group_channels:
-        if target["channel_id"] == message.channel.id:
-            continue
+    tasks = [
+        relay_to_target(
+            message=message,
+            source_lang=source_lang,
+            group_name=row["group_name"],
+            target=target,
+            original_text=original_text,
+            attachment_links=attachment_links,
+            display_name=display_name,
+            avatar_url=avatar_url,
+        )
+        for target in group_channels
+        if target["channel_id"] != message.channel.id
+    ]
 
-        target_channel = message.guild.get_channel(target["channel_id"])
-        if not isinstance(target_channel, discord.TextChannel):
-            log.warning("Linked channel %s was not found or is not a text channel", target["channel_id"])
-            continue
-
-        try:
-            translated_text = await bot.translate_text(original_text, source_lang, target["language_code"])
-        except Exception as exc:
-            log.exception(
-                "Failed to translate message from %s to %s in group %s: %s",
-                source_lang,
-                target["language_code"],
-                row["group_name"],
-                exc,
-            )
-            continue
-
-        final_content = translated_text.strip()
-        if attachment_links:
-            if final_content:
-                final_content += "\n\n"
-            final_content += "\n".join(attachment_links)
-
-        if not final_content:
-            continue
-
-        try:
-            webhook = await bot.get_or_create_webhook(target_channel, message.guild.id)
-            await webhook.send(
-                content=final_content,
-                username=display_name[:80],
-                avatar_url=avatar_url,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.Forbidden:
-            log.exception("Missing permission to create or use webhooks in #%s", target_channel.name)
-        except Exception:
-            log.exception("Failed to relay message into #%s", target_channel.name)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     await bot.process_commands(message)
 
