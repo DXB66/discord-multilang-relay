@@ -27,6 +27,9 @@ DETECT_MIN_TEXT_LENGTH = int(os.getenv("DETECT_MIN_TEXT_LENGTH", "4"))
 MAX_CONCURRENT_RELAYS = max(1, int(os.getenv("MAX_CONCURRENT_RELAYS", "3")))
 TRANSLATE_RETRIES = max(0, int(os.getenv("TRANSLATE_RETRIES", "1")))
 TRANSLATE_RETRY_DELAY = float(os.getenv("TRANSLATE_RETRY_DELAY", "0.7"))
+STRICT_LATIN_MISMATCH_MIN_CHARS = max(1, int(os.getenv("STRICT_LATIN_MISMATCH_MIN_CHARS", "18")))
+STRICT_LATIN_MISMATCH_MIN_WORDS = max(1, int(os.getenv("STRICT_LATIN_MISMATCH_MIN_WORDS", "3")))
+
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Add it in Railway Variables.")
@@ -343,6 +346,87 @@ def language_matches(expected: str, detected: str) -> bool:
         return detected_norm in zh_aliases.get(expected_norm, {expected_norm})
 
     return False
+
+
+def script_bucket_for_language(code: str) -> str:
+    norm = normalize_language_code(code)
+    base = norm.split("-", 1)[0]
+
+    if base == "ar":
+        return "arabic"
+    if base == "ru":
+        return "cyrillic"
+    if base == "ko":
+        return "hangul"
+    if norm.startswith("zh") or base == "zh":
+        return "han"
+
+    return "latin"
+
+
+def char_script_bucket(ch: str) -> Optional[str]:
+    cp = ord(ch)
+
+    if 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F or 0x08A0 <= cp <= 0x08FF:
+        return "arabic"
+    if 0x0400 <= cp <= 0x04FF or 0x0500 <= cp <= 0x052F:
+        return "cyrillic"
+    if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
+        return "han"
+    if 0x3040 <= cp <= 0x30FF:
+        return "kana"
+    if 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF:
+        return "hangul"
+    if ch.isalpha():
+        return "latin"
+
+    return None
+
+
+def detect_text_script(text: str) -> Optional[str]:
+    counts: dict[str, int] = {}
+    for ch in text:
+        bucket = char_script_bucket(ch)
+        if not bucket:
+            continue
+        counts[bucket] = counts.get(bucket, 0) + 1
+
+    if not counts:
+        return None
+
+    return max(counts, key=counts.get)
+
+
+def should_ignore_for_language_mismatch(expected_lang: str, detected_lang: Optional[str], text: str) -> tuple[bool, Optional[str]]:
+    if not detected_lang or language_matches(expected_lang, detected_lang):
+        return False, None
+
+    expected_script = script_bucket_for_language(expected_lang)
+    detected_script = script_bucket_for_language(detected_lang)
+    text_script = detect_text_script(text)
+    cleaned = " ".join(text.split())
+    word_count = len(cleaned.split())
+
+    if text_script and expected_script and text_script != expected_script:
+        return True, (
+            f"text script {text_script} did not match expected channel script {expected_script} "
+            f"(detected language {detected_lang})"
+        )
+
+    if expected_script != "latin" or detected_script != "latin":
+        return True, (
+            f"detected language {detected_lang} did not match expected channel language {expected_lang}"
+        )
+
+    if len(cleaned) >= STRICT_LATIN_MISMATCH_MIN_CHARS and word_count >= STRICT_LATIN_MISMATCH_MIN_WORDS:
+        return True, (
+            f"detected language {detected_lang} did not match expected channel language {expected_lang} "
+            f"for a longer Latin-script message"
+        )
+
+    return False, (
+        f"allowed ambiguous short Latin-script text; detected {detected_lang}, expected {expected_lang}"
+    )
 
 
 bot = RelayBot()
@@ -677,14 +761,24 @@ async def on_message(message: discord.Message) -> None:
             )
             detected_language = None
 
-        if detected_language and not language_matches(source_lang, detected_language):
+        ignore_message, ignore_reason = should_ignore_for_language_mismatch(
+            source_lang,
+            detected_language,
+            original_text,
+        )
+        if ignore_message:
             log.info(
-                "Ignored message in #%s because detected language %s did not match expected channel language %s",
+                "Ignored message in #%s because %s",
                 getattr(message.channel, "name", message.channel.id),
-                detected_language,
-                source_lang,
+                ignore_reason,
             )
             return
+        if ignore_reason:
+            log.debug(
+                "Language guard allowed message in #%s: %s",
+                getattr(message.channel, "name", message.channel.id),
+                ignore_reason,
+            )
 
     relay_targets = [
         target
