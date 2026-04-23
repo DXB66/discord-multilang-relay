@@ -88,6 +88,91 @@ def build_no_drop_fallback_content(source_lang: str, original_text: str, attachm
     return "\n\n".join(part for part in parts if part).strip()
 
 
+def split_text_for_limit(text: str, limit: int) -> list[str]:
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+
+    if len(cleaned) <= limit:
+        return [cleaned]
+
+    paragraphs = cleaned.split("\n")
+    chunks: list[str] = []
+    current = ""
+
+    def flush_current() -> None:
+        nonlocal current
+        if current:
+            chunks.append(current)
+            current = ""
+
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            if current and len(current) + 2 <= limit:
+                current += "\n\n"
+            else:
+                flush_current()
+            continue
+
+        if len(paragraph) <= limit:
+            candidate = f"{current}\n{paragraph}".strip() if current else paragraph
+            if len(candidate) <= limit:
+                current = candidate
+            else:
+                flush_current()
+                current = paragraph
+            continue
+
+        words = paragraph.split()
+        piece = ""
+        for word in words:
+            candidate = f"{piece} {word}".strip()
+            if len(candidate) <= limit:
+                piece = candidate
+                continue
+
+            if piece:
+                candidate = f"{current}\n{piece}".strip() if current else piece
+                if len(candidate) <= limit:
+                    current = candidate
+                else:
+                    flush_current()
+                    current = piece
+                piece = ""
+
+            if len(word) <= limit:
+                piece = word
+            else:
+                for i in range(0, len(word), limit):
+                    sub = word[i:i + limit]
+                    candidate = f"{current}\n{sub}".strip() if current else sub
+                    if len(candidate) <= limit:
+                        current = candidate
+                    else:
+                        flush_current()
+                        current = sub
+
+        if piece:
+            candidate = f"{current}\n{piece}".strip() if current else piece
+            if len(candidate) <= limit:
+                current = candidate
+            else:
+                flush_current()
+                current = piece
+
+    flush_current()
+    return [chunk for chunk in chunks if chunk]
+
+
+def build_translate_chunks(text: str) -> list[str]:
+    return split_text_for_limit(text, TRANSLATE_CHUNK_LIMIT)
+
+
+def build_discord_chunks(text: str) -> list[str]:
+    return split_text_for_limit(text, DISCORD_MESSAGE_LIMIT)
+
+
 class RelayBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -147,6 +232,17 @@ class RelayBot(commands.Bot):
                 FOREIGN KEY (guild_id, group_name)
                     REFERENCES relay_groups (guild_id, group_name)
                     ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS relayed_messages (
+                guild_id INTEGER NOT NULL,
+                source_channel_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                target_channel_id INTEGER NOT NULL,
+                target_message_id INTEGER NOT NULL,
+                target_index INTEGER NOT NULL,
+                PRIMARY KEY (target_message_id),
+                UNIQUE (source_message_id, target_channel_id, target_index)
             );
             """
         )
@@ -253,6 +349,84 @@ class RelayBot(commands.Bot):
             WHERE guild_id = ? AND channel_id = ?
             """,
             (webhook_url, guild_id, channel_id),
+        )
+        await self.db.commit()
+
+
+    async def replace_relay_records(
+        self,
+        guild_id: int,
+        source_channel_id: int,
+        source_message_id: int,
+        target_channel_id: int,
+        target_message_ids: list[int],
+    ) -> None:
+        assert self.db is not None
+        await self.db.execute(
+            """
+            DELETE FROM relayed_messages
+            WHERE guild_id = ? AND source_channel_id = ? AND source_message_id = ? AND target_channel_id = ?
+            """,
+            (guild_id, source_channel_id, source_message_id, target_channel_id),
+        )
+        for index, target_message_id in enumerate(target_message_ids):
+            await self.db.execute(
+                """
+                INSERT OR REPLACE INTO relayed_messages (
+                    guild_id,
+                    source_channel_id,
+                    source_message_id,
+                    target_channel_id,
+                    target_message_id,
+                    target_index
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    source_channel_id,
+                    source_message_id,
+                    target_channel_id,
+                    target_message_id,
+                    index,
+                ),
+            )
+        await self.db.commit()
+
+    async def get_relay_records_for_source(self, guild_id: int, source_channel_id: int, source_message_id: int):
+        assert self.db is not None
+        cursor = await self.db.execute(
+            """
+            SELECT guild_id, source_channel_id, source_message_id, target_channel_id, target_message_id, target_index
+            FROM relayed_messages
+            WHERE guild_id = ? AND source_channel_id = ? AND source_message_id = ?
+            ORDER BY target_channel_id, target_index
+            """,
+            (guild_id, source_channel_id, source_message_id),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return rows
+
+    async def delete_relay_records_for_source(self, guild_id: int, source_channel_id: int, source_message_id: int) -> None:
+        assert self.db is not None
+        await self.db.execute(
+            """
+            DELETE FROM relayed_messages
+            WHERE guild_id = ? AND source_channel_id = ? AND source_message_id = ?
+            """,
+            (guild_id, source_channel_id, source_message_id),
+        )
+        await self.db.commit()
+
+    async def delete_relay_record_by_target_message(self, target_message_id: int) -> None:
+        assert self.db is not None
+        await self.db.execute(
+            """
+            DELETE FROM relayed_messages
+            WHERE target_message_id = ?
+            """,
+            (target_message_id,),
         )
         await self.db.commit()
 
@@ -480,6 +654,24 @@ def should_ignore_for_language_mismatch(expected_lang: str, detected_lang: Optio
     return False, (
         f"allowed ambiguous short Latin-script text; detected {detected_lang}, expected {expected_lang}"
     )
+
+
+def group_relay_rows_by_target(rows: list[aiosqlite.Row]) -> dict[int, list[int]]:
+    grouped: dict[int, list[int]] = {}
+    for row in rows:
+        grouped.setdefault(row["target_channel_id"], []).append(row["target_message_id"])
+    return grouped
+
+
+async def resolve_text_channel(channel_id: int) -> Optional[discord.TextChannel]:
+    channel = bot.get_channel(channel_id)
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    try:
+        fetched = await bot.fetch_channel(channel_id)
+    except Exception:
+        return None
+    return fetched if isinstance(fetched, discord.TextChannel) else None
 
 
 bot = RelayBot()
@@ -718,6 +910,7 @@ async def test_translate(
     )
 
 
+
 async def relay_to_target(
     message: discord.Message,
     source_lang: str,
@@ -727,17 +920,18 @@ async def relay_to_target(
     attachment_links: list[str],
     display_name: str,
     avatar_url: str,
-) -> None:
+    existing_message_ids: Optional[list[int]] = None,
+) -> tuple[int, list[int]] | None:
     if message.guild is None:
-        return
+        return None
 
     if target["channel_id"] == message.channel.id:
-        return
+        return None
 
     target_channel = message.guild.get_channel(target["channel_id"])
     if not isinstance(target_channel, discord.TextChannel):
         log.warning("Linked channel %s was not found or is not a text channel", target["channel_id"])
-        return
+        return None
 
     used_fallback = False
 
@@ -753,7 +947,7 @@ async def relay_to_target(
                 group_name,
                 exc,
             )
-            return
+            return None
 
         used_fallback = True
         final_content = build_no_drop_fallback_content(source_lang, original_text, attachment_links)
@@ -771,35 +965,53 @@ async def relay_to_target(
         final_content += "\n".join(attachment_links)
 
     if not final_content:
-        return
+        return None
 
     try:
         webhook = await bot.get_or_create_webhook(target_channel, message.guild.id)
-        for chunk in build_discord_chunks(final_content):
-            await webhook.send(
+        sent_ids: list[int] = []
+        chunks = build_discord_chunks(final_content)
+        previous_ids = existing_message_ids or []
+
+        for index, chunk in enumerate(chunks):
+            if index < len(previous_ids):
+                previous_id = previous_ids[index]
+                try:
+                    await webhook.edit_message(
+                        previous_id,
+                        content=chunk,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    sent_ids.append(previous_id)
+                    continue
+                except discord.NotFound:
+                    pass
+
+            sent_message = await webhook.send(
                 content=chunk,
                 username=display_name[:80],
                 avatar_url=avatar_url,
                 allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
             )
+            sent_ids.append(sent_message.id)
+
+        for extra_message_id in previous_ids[len(chunks):]:
+            try:
+                await webhook.delete_message(extra_message_id)
+            except discord.NotFound:
+                pass
+
+        return target["channel_id"], sent_ids
     except discord.Forbidden:
         log.exception("Missing permission to create or use webhooks in #%s", target_channel.name)
     except Exception:
         log.exception("Failed to relay message into #%s", target_channel.name)
+    return None
 
 
-@bot.event
-async def on_message(message: discord.Message) -> None:
+async def sync_linked_message(message: discord.Message, existing_records_by_target: Optional[dict[int, list[int]]] = None) -> None:
     if message.guild is None:
-        return
-
-    if message.author.bot:
-        return
-
-    if message.webhook_id is not None:
-        return
-
-    if not message.content and not message.attachments:
         return
 
     row = await bot.get_channel_link(message.guild.id, message.channel.id)
@@ -852,25 +1064,144 @@ async def on_message(message: discord.Message) -> None:
         for target in group_channels
         if target["channel_id"] != message.channel.id
     ]
+    if not relay_targets:
+        return
 
-    if relay_targets:
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_RELAYS)
+    existing_records_by_target = existing_records_by_target or {}
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_RELAYS)
 
-        async def run_relay(target: aiosqlite.Row) -> None:
-            async with semaphore:
-                await relay_to_target(
-                    message=message,
-                    source_lang=source_lang,
-                    group_name=row["group_name"],
-                    target=target,
-                    original_text=original_text,
-                    attachment_links=attachment_links,
-                    display_name=display_name,
-                    avatar_url=avatar_url,
-                )
+    async def run_relay(target: aiosqlite.Row):
+        async with semaphore:
+            return await relay_to_target(
+                message=message,
+                source_lang=source_lang,
+                group_name=row["group_name"],
+                target=target,
+                original_text=original_text,
+                attachment_links=attachment_links,
+                display_name=display_name,
+                avatar_url=avatar_url,
+                existing_message_ids=existing_records_by_target.get(target["channel_id"]),
+            )
 
-        await asyncio.gather(*(run_relay(target) for target in relay_targets), return_exceptions=True)
+    results = await asyncio.gather(*(run_relay(target) for target in relay_targets), return_exceptions=True)
 
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        if not result:
+            continue
+        target_channel_id, sent_ids = result
+        await bot.replace_relay_records(
+            message.guild.id,
+            message.channel.id,
+            message.id,
+            target_channel_id,
+            sent_ids,
+        )
+
+
+async def delete_mirrored_messages(guild_id: int, source_channel_id: int, source_message_id: int) -> None:
+    rows = await bot.get_relay_records_for_source(guild_id, source_channel_id, source_message_id)
+    if not rows:
+        return
+
+    grouped = group_relay_rows_by_target(rows)
+
+    for target_channel_id, target_message_ids in grouped.items():
+        target_channel = await resolve_text_channel(target_channel_id)
+        if not target_channel:
+            continue
+
+        try:
+            webhook = await bot.get_or_create_webhook(target_channel, guild_id)
+        except Exception:
+            log.exception("Failed to prepare webhook for delete-sync in channel %s", target_channel_id)
+            continue
+
+        for target_message_id in target_message_ids:
+            try:
+                await webhook.delete_message(target_message_id)
+            except discord.NotFound:
+                pass
+            except Exception:
+                log.exception("Failed to delete mirrored message %s in channel %s", target_message_id, target_channel_id)
+
+    await bot.delete_relay_records_for_source(guild_id, source_channel_id, source_message_id)
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
+    if payload.guild_id is None:
+        return
+
+    await delete_mirrored_messages(payload.guild_id, payload.channel_id, payload.message_id)
+    await bot.delete_relay_record_by_target_message(payload.message_id)
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent) -> None:
+    if payload.guild_id is None:
+        return
+
+    for message_id in payload.message_ids:
+        await delete_mirrored_messages(payload.guild_id, payload.channel_id, message_id)
+        await bot.delete_relay_record_by_target_message(message_id)
+
+
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
+    if payload.guild_id is None:
+        return
+
+    if "content" not in payload.data and "attachments" not in payload.data:
+        return
+
+    channel = await resolve_text_channel(payload.channel_id)
+    if not channel:
+        return
+
+    row = await bot.get_channel_link(payload.guild_id, payload.channel_id)
+    if row is None:
+        return
+
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except discord.NotFound:
+        await delete_mirrored_messages(payload.guild_id, payload.channel_id, payload.message_id)
+        return
+    except Exception:
+        log.exception("Failed to fetch source message %s for edit-sync", payload.message_id)
+        return
+
+    if message.author.bot or message.webhook_id is not None:
+        return
+
+    existing_rows = await bot.get_relay_records_for_source(payload.guild_id, payload.channel_id, payload.message_id)
+    existing_records_by_target = group_relay_rows_by_target(existing_rows)
+
+    if not message.content and not message.attachments:
+        await delete_mirrored_messages(payload.guild_id, payload.channel_id, payload.message_id)
+        return
+
+    await sync_linked_message(message, existing_records_by_target)
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.guild is None:
+        return
+
+    if message.author.bot:
+        return
+
+    if message.webhook_id is not None:
+        return
+
+    if not message.content and not message.attachments:
+        return
+
+    await sync_linked_message(message)
     await bot.process_commands(message)
 
 
