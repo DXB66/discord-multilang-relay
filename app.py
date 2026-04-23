@@ -42,6 +42,37 @@ if GUILD_ID_RAW:
         raise RuntimeError("GUILD_ID must be a number.") from exc
 
 
+def is_retryable_translate_error(exc: Exception) -> bool:
+    if isinstance(
+        exc,
+        (
+            asyncio.TimeoutError,
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+            aiohttp.ServerDisconnectedError,
+        ),
+    ):
+        return True
+
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        retryable_markers = (
+            "libretranslate error 429",
+            "libretranslate error 500",
+            "libretranslate error 502",
+            "libretranslate error 503",
+            "libretranslate error 504",
+            "server disconnected",
+            "timeout",
+            "temporarily unavailable",
+            "internal error",
+            "overloaded",
+        )
+        return any(marker in message for marker in retryable_markers)
+
+    return False
+
+
 class RelayBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
