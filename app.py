@@ -31,6 +31,8 @@ STRICT_LATIN_MISMATCH_MIN_CHARS = max(1, int(os.getenv("STRICT_LATIN_MISMATCH_MI
 STRICT_LATIN_MISMATCH_MIN_WORDS = max(1, int(os.getenv("STRICT_LATIN_MISMATCH_MIN_WORDS", "3")))
 NO_DROP_FALLBACK = os.getenv("NO_DROP_FALLBACK", "true").lower() in {"1", "true", "yes", "on"}
 FALLBACK_PREFIX_TEMPLATE = os.getenv("FALLBACK_PREFIX_TEMPLATE", "[{source}] ")
+TRANSLATE_CHUNK_LIMIT = max(200, int(os.getenv("TRANSLATE_CHUNK_LIMIT", "1200")))
+DISCORD_MESSAGE_LIMIT = max(500, int(os.getenv("DISCORD_MESSAGE_LIMIT", "2000")))
 
 
 if not BOT_TOKEN:
@@ -263,44 +265,51 @@ class RelayBot(commands.Bot):
 
         assert self.http_session is not None
 
-        payload = {
-            "q": text,
-            "source": source_lang.lower(),
-            "target": target_lang.lower(),
-            "format": "text",
-        }
+        translated_chunks: list[str] = []
 
-        last_exc: Optional[Exception] = None
+        for piece in build_translate_chunks(text):
+            payload = {
+                "q": piece,
+                "source": source_lang.lower(),
+                "target": target_lang.lower(),
+                "format": "text",
+            }
 
-        for attempt in range(TRANSLATE_RETRIES + 1):
-            try:
-                async with self.http_session.post(f"{LIBRETRANSLATE_URL}/translate", json=payload) as response:
-                    body = await response.text()
-                    if response.status >= 400:
-                        raise RuntimeError(f"LibreTranslate error {response.status}: {body}")
+            last_exc: Optional[Exception] = None
 
-                    data = await response.json()
-                    translated = data.get("translatedText")
-                    if not translated:
-                        raise RuntimeError(f"Unexpected translation response: {data}")
-                    return translated
-            except Exception as exc:
-                last_exc = exc
-                if attempt < TRANSLATE_RETRIES and is_retryable_translate_error(exc):
-                    delay = TRANSLATE_RETRY_DELAY * (attempt + 1)
-                    log.warning(
-                        "Retrying translation %s -> %s in %.1fs after error: %s",
-                        source_lang,
-                        target_lang,
-                        delay,
-                        exc,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                raise
+            for attempt in range(TRANSLATE_RETRIES + 1):
+                try:
+                    async with self.http_session.post(f"{LIBRETRANSLATE_URL}/translate", json=payload) as response:
+                        body = await response.text()
+                        if response.status >= 400:
+                            raise RuntimeError(f"LibreTranslate error {response.status}: {body}")
 
-        assert last_exc is not None
-        raise last_exc
+                        data = await response.json()
+                        translated = data.get("translatedText")
+                        if not translated:
+                            raise RuntimeError(f"Unexpected translation response: {data}")
+
+                        translated_chunks.append(translated)
+                        break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < TRANSLATE_RETRIES and is_retryable_translate_error(exc):
+                        delay = TRANSLATE_RETRY_DELAY * (attempt + 1)
+                        log.warning(
+                            "Retrying translation %s -> %s in %.1fs after error: %s",
+                            source_lang,
+                            target_lang,
+                            delay,
+                            exc,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+
+            if last_exc is not None and len(translated_chunks) == 0:
+                raise last_exc
+
+        return "".join(translated_chunks)
 
     async def get_languages(self) -> list[dict]:
         assert self.http_session is not None
@@ -766,12 +775,13 @@ async def relay_to_target(
 
     try:
         webhook = await bot.get_or_create_webhook(target_channel, message.guild.id)
-        await webhook.send(
-            content=final_content,
-            username=display_name[:80],
-            avatar_url=avatar_url,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        for chunk in build_discord_chunks(final_content):
+            await webhook.send(
+                content=chunk,
+                username=display_name[:80],
+                avatar_url=avatar_url,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
     except discord.Forbidden:
         log.exception("Missing permission to create or use webhooks in #%s", target_channel.name)
     except Exception:
