@@ -24,6 +24,9 @@ DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
 
 ENFORCE_SOURCE_LANGUAGE = os.getenv("ENFORCE_SOURCE_LANGUAGE", "true").lower() in {"1", "true", "yes", "on"}
 DETECT_MIN_TEXT_LENGTH = int(os.getenv("DETECT_MIN_TEXT_LENGTH", "4"))
+MAX_CONCURRENT_RELAYS = max(1, int(os.getenv("MAX_CONCURRENT_RELAYS", "3")))
+TRANSLATE_RETRIES = max(0, int(os.getenv("TRANSLATE_RETRIES", "1")))
+TRANSLATE_RETRY_DELAY = float(os.getenv("TRANSLATE_RETRY_DELAY", "0.7"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Add it in Railway Variables.")
@@ -220,16 +223,37 @@ class RelayBot(commands.Bot):
             "format": "text",
         }
 
-        async with self.http_session.post(f"{LIBRETRANSLATE_URL}/translate", json=payload) as response:
-            body = await response.text()
-            if response.status >= 400:
-                raise RuntimeError(f"LibreTranslate error {response.status}: {body}")
+        last_exc: Optional[Exception] = None
 
-            data = await response.json()
-            translated = data.get("translatedText")
-            if not translated:
-                raise RuntimeError(f"Unexpected translation response: {data}")
-            return translated
+        for attempt in range(TRANSLATE_RETRIES + 1):
+            try:
+                async with self.http_session.post(f"{LIBRETRANSLATE_URL}/translate", json=payload) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        raise RuntimeError(f"LibreTranslate error {response.status}: {body}")
+
+                    data = await response.json()
+                    translated = data.get("translatedText")
+                    if not translated:
+                        raise RuntimeError(f"Unexpected translation response: {data}")
+                    return translated
+            except Exception as exc:
+                last_exc = exc
+                if attempt < TRANSLATE_RETRIES and is_retryable_translate_error(exc):
+                    delay = TRANSLATE_RETRY_DELAY * (attempt + 1)
+                    log.warning(
+                        "Retrying translation %s -> %s in %.1fs after error: %s",
+                        source_lang,
+                        target_lang,
+                        delay,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+
+        assert last_exc is not None
+        raise last_exc
 
     async def get_languages(self) -> list[dict]:
         assert self.http_session is not None
@@ -662,23 +686,29 @@ async def on_message(message: discord.Message) -> None:
             )
             return
 
-    tasks = [
-        relay_to_target(
-            message=message,
-            source_lang=source_lang,
-            group_name=row["group_name"],
-            target=target,
-            original_text=original_text,
-            attachment_links=attachment_links,
-            display_name=display_name,
-            avatar_url=avatar_url,
-        )
+    relay_targets = [
+        target
         for target in group_channels
         if target["channel_id"] != message.channel.id
     ]
 
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    if relay_targets:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_RELAYS)
+
+        async def run_relay(target: aiosqlite.Row) -> None:
+            async with semaphore:
+                await relay_to_target(
+                    message=message,
+                    source_lang=source_lang,
+                    group_name=row["group_name"],
+                    target=target,
+                    original_text=original_text,
+                    attachment_links=attachment_links,
+                    display_name=display_name,
+                    avatar_url=avatar_url,
+                )
+
+        await asyncio.gather(*(run_relay(target) for target in relay_targets), return_exceptions=True)
 
     await bot.process_commands(message)
 
