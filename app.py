@@ -22,6 +22,9 @@ LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://localhost:5000").rs
 GUILD_ID_RAW = os.getenv("GUILD_ID")
 DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
 
+ENFORCE_SOURCE_LANGUAGE = os.getenv("ENFORCE_SOURCE_LANGUAGE", "true").lower() in {"1", "true", "yes", "on"}
+DETECT_MIN_TEXT_LENGTH = int(os.getenv("DETECT_MIN_TEXT_LENGTH", "4"))
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Add it in Railway Variables.")
 
@@ -240,6 +243,32 @@ class RelayBot(commands.Bot):
                 raise RuntimeError(f"Unexpected languages response: {data}")
             return data
 
+    async def detect_language(self, text: str) -> Optional[str]:
+        cleaned = text.strip()
+        if len(cleaned) < DETECT_MIN_TEXT_LENGTH:
+            return None
+
+        assert self.http_session is not None
+
+        async with self.http_session.post(f"{LIBRETRANSLATE_URL}/detect", json={"q": cleaned}) as response:
+            body = await response.text()
+            if response.status >= 400:
+                raise RuntimeError(f"LibreTranslate error {response.status}: {body}")
+
+            data = await response.json()
+            if not isinstance(data, list) or not data:
+                raise RuntimeError(f"Unexpected detect response: {data}")
+
+            best = data[0]
+            if not isinstance(best, dict):
+                raise RuntimeError(f"Unexpected detect response: {data}")
+
+            language = best.get("language")
+            if not language:
+                raise RuntimeError(f"Unexpected detect response: {data}")
+
+            return normalize_language_code(str(language))
+
     async def get_or_create_webhook(self, channel: discord.TextChannel, guild_id: int) -> discord.Webhook:
         cached = self.webhook_cache.get(channel.id)
         if cached:
@@ -262,6 +291,34 @@ class RelayBot(commands.Bot):
         await self.set_webhook_url(guild_id, channel.id, webhook.url)
         self.webhook_cache[channel.id] = webhook
         return webhook
+
+
+def normalize_language_code(code: str) -> str:
+    return code.strip().lower().replace("_", "-")
+
+
+def language_matches(expected: str, detected: str) -> bool:
+    expected_norm = normalize_language_code(expected)
+    detected_norm = normalize_language_code(detected)
+
+    if expected_norm == detected_norm:
+        return True
+
+    expected_base = expected_norm.split("-", 1)[0]
+    detected_base = detected_norm.split("-", 1)[0]
+
+    if expected_base == detected_base and expected_base != "zh":
+        return True
+
+    zh_aliases = {
+        "zh": {"zh", "zh-cn", "zh-sg", "zh-hans", "zh-tw", "zh-hk", "zh-mo", "zh-hant"},
+        "zh-hans": {"zh", "zh-cn", "zh-sg", "zh-hans"},
+        "zh-hant": {"zh", "zh-tw", "zh-hk", "zh-mo", "zh-hant"},
+    }
+    if expected_norm.startswith("zh"):
+        return detected_norm in zh_aliases.get(expected_norm, {expected_norm})
+
+    return False
 
 
 bot = RelayBot()
@@ -583,6 +640,27 @@ async def on_message(message: discord.Message) -> None:
     attachment_links = [a.url for a in message.attachments]
     display_name = message.author.display_name
     avatar_url = message.author.display_avatar.url
+
+    if ENFORCE_SOURCE_LANGUAGE and original_text.strip():
+        try:
+            detected_language = await bot.detect_language(original_text)
+        except Exception as exc:
+            log.warning(
+                "Language detection failed for message in #%s. Continuing with channel language %s. Error: %s",
+                getattr(message.channel, "name", message.channel.id),
+                source_lang,
+                exc,
+            )
+            detected_language = None
+
+        if detected_language and not language_matches(source_lang, detected_language):
+            log.info(
+                "Ignored message in #%s because detected language %s did not match expected channel language %s",
+                getattr(message.channel, "name", message.channel.id),
+                detected_language,
+                source_lang,
+            )
+            return
 
     tasks = [
         relay_to_target(
