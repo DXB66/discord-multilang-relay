@@ -806,7 +806,6 @@ async def group_remove(interaction: discord.Interaction, channel: discord.TextCh
 
 
 @bot.tree.command(name="group_list", description="Show all linked groups and channels.")
-@owner_or_manage_guild()
 async def group_list(interaction: discord.Interaction):
     assert interaction.guild is not None
 
