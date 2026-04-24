@@ -673,14 +673,27 @@ def owner_or_manage_guild() -> app_commands.check:
         if not interaction.guild or not interaction.user:
             return False
 
+        # Server owner always allowed
         if interaction.user.id == interaction.guild.owner_id:
             return True
 
-        member = interaction.guild.get_member(interaction.user.id)
-        if member and member.guild_permissions.manage_guild:
+        # In slash commands, interaction.user is usually a discord.Member.
+        # Check permissions directly from it first.
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        if permissions and (permissions.administrator or permissions.manage_guild):
             return True
 
-        raise app_commands.CheckFailure("You need Manage Server permission to use this command.")
+        # Fallback: fetch member if Discord did not provide full member permissions.
+        try:
+            member = await interaction.guild.fetch_member(interaction.user.id)
+            if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
+                return True
+        except Exception:
+            pass
+
+        raise app_commands.CheckFailure(
+            "You need Administrator or Manage Server permission to use this command."
+        )
 
     return app_commands.check(predicate)
 
@@ -689,7 +702,7 @@ def owner_or_manage_guild() -> app_commands.check:
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     message = str(error)
     if isinstance(error, app_commands.CheckFailure):
-        message = "You need **Manage Server** permission to use this command."
+        message = "You need **Administrator** or **Manage Server** permission to use this command."
     elif isinstance(error, app_commands.CommandInvokeError) and error.original:
         message = f"Error: {error.original}"
 
