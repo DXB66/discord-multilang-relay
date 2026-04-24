@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,18 @@ NO_DROP_FALLBACK = os.getenv("NO_DROP_FALLBACK", "true").lower() in {"1", "true"
 FALLBACK_PREFIX_TEMPLATE = os.getenv("FALLBACK_PREFIX_TEMPLATE", "[{source}] ")
 TRANSLATE_CHUNK_LIMIT = max(200, int(os.getenv("TRANSLATE_CHUNK_LIMIT", "1200")))
 DISCORD_MESSAGE_LIMIT = max(500, int(os.getenv("DISCORD_MESSAGE_LIMIT", "2000")))
+# Protect Discord-only syntax from translation engines.
+# Examples:
+# - custom emojis: <:catglare:1485998314796089476>, <a:dance:123456789012345678>
+# - mentions/channels/roles: <@123>, <@!123>, <#123>, <@&123>
+# - Discord timestamps: <t:1700000000:R>
+DISCORD_PROTECTED_TOKEN_RE = re.compile(
+    r"<a?:[A-Za-z0-9_]{2,32}:\d{15,25}>"
+    r"|<@!?\d{15,25}>"
+    r"|<@&\d{15,25}>"
+    r"|<#\d{15,25}>"
+    r"|<t:\d{1,12}(?::[tTdDfFR])?>"
+)
 
 
 if not BOT_TOKEN:
@@ -483,6 +496,34 @@ class RelayBot(commands.Bot):
         if source_norm == target_norm:
             return text
 
+        # Preserve Discord custom emojis/mentions/timestamps by translating only
+        # the normal text around them, then putting the original token back.
+        # Without this, translation can corrupt <:emoji_name:emoji_id> syntax.
+        protected_matches = list(DISCORD_PROTECTED_TOKEN_RE.finditer(text))
+        if protected_matches:
+            translated_parts: list[str] = []
+            last_index = 0
+
+            for match in protected_matches:
+                before = text[last_index:match.start()]
+                if before:
+                    if before.strip():
+                        translated_parts.append(await self.translate_text(before, source_lang, target_lang))
+                    else:
+                        translated_parts.append(before)
+
+                translated_parts.append(match.group(0))
+                last_index = match.end()
+
+            after = text[last_index:]
+            if after:
+                if after.strip():
+                    translated_parts.append(await self.translate_text(after, source_lang, target_lang))
+                else:
+                    translated_parts.append(after)
+
+            return "".join(translated_parts)
+
         # LibreTranslate's direct Traditional Chinese target model can produce
         # repeated/garbled output. Translate to Simplified Chinese first, then
         # convert locally to Traditional with OpenCC.
@@ -753,14 +794,26 @@ def owner_or_manage_guild() -> app_commands.check:
         if not interaction.guild or not interaction.user:
             return False
 
+        # Server owner always allowed.
         if interaction.user.id == interaction.guild.owner_id:
             return True
 
-        member = interaction.guild.get_member(interaction.user.id)
-        if member and member.guild_permissions.manage_guild:
+        # In slash commands, interaction.user is usually a discord.Member.
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        if permissions and (permissions.administrator or permissions.manage_guild):
             return True
 
-        raise app_commands.CheckFailure("You need Manage Server permission to use this command.")
+        # Fallback if Discord did not include complete member permissions.
+        try:
+            member = await interaction.guild.fetch_member(interaction.user.id)
+            if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
+                return True
+        except Exception:
+            pass
+
+        raise app_commands.CheckFailure(
+            "You need Administrator or Manage Server permission to use this command."
+        )
 
     return app_commands.check(predicate)
 
@@ -769,7 +822,7 @@ def owner_or_manage_guild() -> app_commands.check:
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     message = str(error)
     if isinstance(error, app_commands.CheckFailure):
-        message = "You need **Manage Server** permission to use this command."
+        message = "You need **Administrator** or **Manage Server** permission to use this command."
     elif isinstance(error, app_commands.CommandInvokeError) and error.original:
         message = f"Error: {error.original}"
 
@@ -886,7 +939,6 @@ async def group_remove(interaction: discord.Interaction, channel: discord.TextCh
 
 
 @bot.tree.command(name="group_list", description="Show all linked groups and channels.")
-@owner_or_manage_guild()
 async def group_list(interaction: discord.Interaction):
     assert interaction.guild is not None
 
