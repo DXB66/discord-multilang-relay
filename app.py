@@ -19,7 +19,8 @@ log = logging.getLogger("multilang-relay")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://localhost:5000").rstrip("/")
-GUILD_ID_RAW = os.getenv("GUILD_ID")
+# Multi-server mode: commands are registered globally, and each server keeps its
+# own configuration in the database by guild_id. Do not set a GUILD_ID.
 DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
 
 ENFORCE_SOURCE_LANGUAGE = os.getenv("ENFORCE_SOURCE_LANGUAGE", "true").lower() in {"1", "true", "yes", "on"}
@@ -36,15 +37,7 @@ DISCORD_MESSAGE_LIMIT = max(500, int(os.getenv("DISCORD_MESSAGE_LIMIT", "2000"))
 
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Add it in Railway Variables.")
-
-GUILD_ID: Optional[int] = None
-if GUILD_ID_RAW:
-    try:
-        GUILD_ID = int(GUILD_ID_RAW)
-    except ValueError as exc:
-        raise RuntimeError("GUILD_ID must be a number.") from exc
-
+    raise RuntimeError("BOT_TOKEN is missing. Add it in your .env or environment variables.")
 
 def is_retryable_translate_error(exc: Exception) -> bool:
     if isinstance(
@@ -194,14 +187,12 @@ class RelayBot(commands.Bot):
         timeout = aiohttp.ClientTimeout(total=30)
         self.http_session = aiohttp.ClientSession(timeout=timeout)
 
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            log.info("Synced %s guild command(s) to guild %s", len(synced), GUILD_ID)
-        else:
-            synced = await self.tree.sync()
-            log.info("Synced %s global command(s)", len(synced))
+        synced = await self.tree.sync()
+        log.info(
+            "Synced %s global command(s). Multi-server mode is enabled; "
+            "each Discord server keeps separate groups/channels in the database.",
+            len(synced),
+        )
 
     async def close(self) -> None:
         if self.http_session and not self.http_session.closed:
@@ -714,6 +705,12 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.event
 async def on_ready() -> None:
     log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+    log.info("Currently connected to %s Discord server(s).", len(bot.guilds))
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild) -> None:
+    log.info("Joined new server: %s (%s). Use /group_create and /group_add there to configure linked channels.", guild.name, guild.id)
 
 
 @bot.tree.command(name="group_create", description="Create a linked translation group.")
