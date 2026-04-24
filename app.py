@@ -237,6 +237,7 @@ class RelayBot(commands.Bot):
         intents.guilds = True
         intents.messages = True
         intents.message_content = True
+        intents.reactions = True
 
         super().__init__(command_prefix="!", intents=intents)
         self.db: Optional[aiosqlite.Connection] = None
@@ -463,6 +464,48 @@ class RelayBot(commands.Bot):
         rows = await cursor.fetchall()
         await cursor.close()
         return rows
+
+    async def get_relay_record_by_target_message(self, guild_id: int, target_message_id: int):
+        assert self.db is not None
+        cursor = await self.db.execute(
+            """
+            SELECT guild_id, source_channel_id, source_message_id, target_channel_id, target_message_id, target_index
+            FROM relayed_messages
+            WHERE guild_id = ? AND target_message_id = ?
+            """,
+            (guild_id, target_message_id),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row
+
+    async def get_related_message_locations(self, guild_id: int, channel_id: int, message_id: int) -> list[tuple[int, int]]:
+        """Return the original message and all mirrored message IDs related to one linked message."""
+        source_channel_id = channel_id
+        source_message_id = message_id
+
+        source_rows = await self.get_relay_records_for_source(guild_id, source_channel_id, source_message_id)
+        if not source_rows:
+            target_row = await self.get_relay_record_by_target_message(guild_id, message_id)
+            if target_row is None:
+                return []
+            source_channel_id = target_row["source_channel_id"]
+            source_message_id = target_row["source_message_id"]
+            source_rows = await self.get_relay_records_for_source(guild_id, source_channel_id, source_message_id)
+
+        locations: list[tuple[int, int]] = [(source_channel_id, source_message_id)]
+        for row in source_rows:
+            locations.append((row["target_channel_id"], row["target_message_id"]))
+
+        deduped: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for location in locations:
+            if location in seen:
+                continue
+            seen.add(location)
+            deduped.append(location)
+
+        return deduped
 
     async def delete_relay_records_for_source(self, guild_id: int, source_channel_id: int, source_message_id: int) -> None:
         assert self.db is not None
@@ -816,7 +859,6 @@ def owner_or_manage_guild() -> app_commands.check:
         )
 
     return app_commands.check(predicate)
-
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
@@ -1276,6 +1318,87 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
     for message_id in payload.message_ids:
         await delete_mirrored_messages(payload.guild_id, payload.channel_id, message_id)
         await bot.delete_relay_record_by_target_message(message_id)
+
+
+async def mirror_reaction_to_linked_messages(payload: discord.RawReactionActionEvent, add: bool) -> None:
+    if payload.guild_id is None:
+        return
+
+    if bot.user and payload.user_id == bot.user.id:
+        return
+
+    related_locations: list[tuple[int, int]] = []
+    for attempt in range(3):
+        related_locations = await bot.get_related_message_locations(
+            payload.guild_id,
+            payload.channel_id,
+            payload.message_id,
+        )
+        if related_locations:
+            break
+        if attempt < 2:
+            await asyncio.sleep(1)
+
+    if len(related_locations) < 2:
+        return
+
+    for channel_id, message_id in related_locations:
+        if channel_id == payload.channel_id and message_id == payload.message_id:
+            continue
+
+        target_channel = await resolve_text_channel(channel_id)
+        if not target_channel:
+            continue
+
+        try:
+            target_message = await target_channel.fetch_message(message_id)
+        except discord.NotFound:
+            continue
+        except Exception:
+            log.exception("Failed to fetch message %s for reaction-sync in channel %s", message_id, channel_id)
+            continue
+
+        try:
+            if add:
+                await target_message.add_reaction(payload.emoji)
+            else:
+                if bot.user is not None:
+                    await target_message.remove_reaction(payload.emoji, bot.user)
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            log.warning(
+                "Missing permission to %s reaction %s on message %s in channel %s",
+                "add" if add else "remove",
+                payload.emoji,
+                message_id,
+                channel_id,
+            )
+        except discord.HTTPException as exc:
+            log.warning(
+                "Could not %s reaction %s on message %s in channel %s: %s",
+                "add" if add else "remove",
+                payload.emoji,
+                message_id,
+                channel_id,
+                exc,
+            )
+        except Exception:
+            log.exception(
+                "Unexpected reaction-sync error for message %s in channel %s",
+                message_id,
+                channel_id,
+            )
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    await mirror_reaction_to_linked_messages(payload, add=True)
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
+    await mirror_reaction_to_linked_messages(payload, add=False)
 
 
 @bot.event
