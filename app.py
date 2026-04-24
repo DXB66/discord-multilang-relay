@@ -166,6 +166,58 @@ def build_discord_chunks(text: str) -> list[str]:
     return split_text_for_limit(text, DISCORD_MESSAGE_LIMIT)
 
 
+def canonical_language_code(code: str) -> str:
+    return code.strip().lower().replace("_", "-")
+
+
+TRADITIONAL_CHINESE_CODES = {"zt", "zh-hant", "zh-tw", "zh-hk", "zh-mo", "traditional"}
+SIMPLIFIED_CHINESE_CODES = {"zh", "zh-hans", "zh-cn", "zh-sg", "simplified"}
+
+try:
+    from opencc import OpenCC
+
+    OPENCC_S2T = OpenCC("s2t")
+    OPENCC_T2S = OpenCC("t2s")
+except Exception:
+    OPENCC_S2T = None
+    OPENCC_T2S = None
+
+
+def is_traditional_chinese_code(code: str) -> bool:
+    return canonical_language_code(code) in TRADITIONAL_CHINESE_CODES
+
+
+def is_simplified_chinese_code(code: str) -> bool:
+    return canonical_language_code(code) in SIMPLIFIED_CHINESE_CODES
+
+
+def libretranslate_language_code(code: str) -> str:
+    normalized = canonical_language_code(code)
+    if normalized in SIMPLIFIED_CHINESE_CODES:
+        return "zh"
+    if normalized in TRADITIONAL_CHINESE_CODES:
+        return "zt"
+    return normalized
+
+
+def simplified_to_traditional(text: str) -> str:
+    if OPENCC_S2T is None:
+        raise RuntimeError(
+            "Traditional Chinese conversion requires opencc-python-reimplemented. "
+            "Add it to requirements.txt and rebuild the Docker image."
+        )
+    return OPENCC_S2T.convert(text)
+
+
+def traditional_to_simplified(text: str) -> str:
+    if OPENCC_T2S is None:
+        raise RuntimeError(
+            "Simplified Chinese conversion requires opencc-python-reimplemented. "
+            "Add it to requirements.txt and rebuild the Docker image."
+        )
+    return OPENCC_T2S.convert(text)
+
+
 class RelayBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -425,56 +477,84 @@ class RelayBot(commands.Bot):
         if not text.strip():
             return text
 
-        if source_lang.lower() == target_lang.lower():
+        source_norm = canonical_language_code(source_lang)
+        target_norm = canonical_language_code(target_lang)
+
+        if source_norm == target_norm:
             return text
 
-        assert self.http_session is not None
+        # LibreTranslate's direct Traditional Chinese target model can produce
+        # repeated/garbled output. Translate to Simplified Chinese first, then
+        # convert locally to Traditional with OpenCC.
+        source_is_traditional = is_traditional_chinese_code(source_norm)
+        target_is_traditional = is_traditional_chinese_code(target_norm)
+        source_is_simplified = is_simplified_chinese_code(source_norm)
+        target_is_simplified = is_simplified_chinese_code(target_norm)
 
-        translated_chunks: list[str] = []
+        if source_is_traditional and target_is_simplified:
+            return traditional_to_simplified(text)
 
-        for piece in build_translate_chunks(text):
-            payload = {
-                "q": piece,
-                "source": source_lang.lower(),
-                "target": target_lang.lower(),
-                "format": "text",
-            }
+        if source_is_simplified and target_is_traditional:
+            return simplified_to_traditional(text)
 
-            last_exc: Optional[Exception] = None
+        libre_source = libretranslate_language_code(source_norm)
+        libre_target = "zh" if target_is_traditional else libretranslate_language_code(target_norm)
 
-            for attempt in range(TRANSLATE_RETRIES + 1):
-                try:
-                    async with self.http_session.post(f"{LIBRETRANSLATE_URL}/translate", json=payload) as response:
-                        body = await response.text()
-                        if response.status >= 400:
-                            raise RuntimeError(f"LibreTranslate error {response.status}: {body}")
+        if libre_source == libre_target:
+            translated_text = text
+        else:
+            assert self.http_session is not None
 
-                        data = await response.json()
-                        translated = data.get("translatedText")
-                        if not translated:
-                            raise RuntimeError(f"Unexpected translation response: {data}")
+            translated_chunks: list[str] = []
 
-                        translated_chunks.append(translated)
-                        break
-                except Exception as exc:
-                    last_exc = exc
-                    if attempt < TRANSLATE_RETRIES and is_retryable_translate_error(exc):
-                        delay = TRANSLATE_RETRY_DELAY * (attempt + 1)
-                        log.warning(
-                            "Retrying translation %s -> %s in %.1fs after error: %s",
-                            source_lang,
-                            target_lang,
-                            delay,
-                            exc,
-                        )
-                        await asyncio.sleep(delay)
-                        continue
-                    raise
+            for piece in build_translate_chunks(text):
+                payload = {
+                    "q": piece,
+                    "source": libre_source,
+                    "target": libre_target,
+                    "format": "text",
+                }
 
-            if last_exc is not None and len(translated_chunks) == 0:
-                raise last_exc
+                last_exc: Optional[Exception] = None
 
-        return "".join(translated_chunks)
+                for attempt in range(TRANSLATE_RETRIES + 1):
+                    try:
+                        async with self.http_session.post(f"{LIBRETRANSLATE_URL}/translate", json=payload) as response:
+                            body = await response.text()
+                            if response.status >= 400:
+                                raise RuntimeError(f"LibreTranslate error {response.status}: {body}")
+
+                            data = await response.json()
+                            translated = data.get("translatedText")
+                            if not translated:
+                                raise RuntimeError(f"Unexpected translation response: {data}")
+
+                            translated_chunks.append(translated)
+                            break
+                    except Exception as exc:
+                        last_exc = exc
+                        if attempt < TRANSLATE_RETRIES and is_retryable_translate_error(exc):
+                            delay = TRANSLATE_RETRY_DELAY * (attempt + 1)
+                            log.warning(
+                                "Retrying translation %s -> %s in %.1fs after error: %s",
+                                libre_source,
+                                libre_target,
+                                delay,
+                                exc,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        raise
+
+                if last_exc is not None and len(translated_chunks) == 0:
+                    raise last_exc
+
+            translated_text = "".join(translated_chunks)
+
+        if target_is_traditional:
+            return simplified_to_traditional(translated_text)
+
+        return translated_text
 
     async def get_languages(self) -> list[dict]:
         assert self.http_session is not None
@@ -539,7 +619,7 @@ class RelayBot(commands.Bot):
 
 
 def normalize_language_code(code: str) -> str:
-    return code.strip().lower().replace("_", "-")
+    return canonical_language_code(code)
 
 
 def language_matches(expected: str, detected: str) -> bool:
@@ -673,27 +753,14 @@ def owner_or_manage_guild() -> app_commands.check:
         if not interaction.guild or not interaction.user:
             return False
 
-        # Server owner always allowed
         if interaction.user.id == interaction.guild.owner_id:
             return True
 
-        # In slash commands, interaction.user is usually a discord.Member.
-        # Check permissions directly from it first.
-        permissions = getattr(interaction.user, "guild_permissions", None)
-        if permissions and (permissions.administrator or permissions.manage_guild):
+        member = interaction.guild.get_member(interaction.user.id)
+        if member and member.guild_permissions.manage_guild:
             return True
 
-        # Fallback: fetch member if Discord did not provide full member permissions.
-        try:
-            member = await interaction.guild.fetch_member(interaction.user.id)
-            if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
-                return True
-        except Exception:
-            pass
-
-        raise app_commands.CheckFailure(
-            "You need Administrator or Manage Server permission to use this command."
-        )
+        raise app_commands.CheckFailure("You need Manage Server permission to use this command.")
 
     return app_commands.check(predicate)
 
@@ -702,7 +769,7 @@ def owner_or_manage_guild() -> app_commands.check:
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     message = str(error)
     if isinstance(error, app_commands.CheckFailure):
-        message = "You need **Administrator** or **Manage Server** permission to use this command."
+        message = "You need **Manage Server** permission to use this command."
     elif isinstance(error, app_commands.CommandInvokeError) and error.original:
         message = f"Error: {error.original}"
 
@@ -819,6 +886,7 @@ async def group_remove(interaction: discord.Interaction, channel: discord.TextCh
 
 
 @bot.tree.command(name="group_list", description="Show all linked groups and channels.")
+@owner_or_manage_guild()
 async def group_list(interaction: discord.Interaction):
     assert interaction.guild is not None
 
