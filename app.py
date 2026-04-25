@@ -49,6 +49,66 @@ DISCORD_PROTECTED_TOKEN_RE = re.compile(
 )
 
 
+# LibreTranslate can mistranslate very short chat phrases, especially into Korean.
+# These exact short-phrase overrides avoid broken outputs like "이름 *" for "Hi/Bye".
+SHORT_PHRASE_OVERRIDES: dict[str, dict[str, str]] = {
+    "ko": {
+        "hi": "안녕하세요",
+        "hello": "안녕하세요",
+        "hey": "안녕하세요",
+        "hiya": "안녕하세요",
+        "yo": "안녕하세요",
+        "bye": "안녕히 가세요",
+        "goodbye": "안녕히 가세요",
+        "see you": "또 만나요",
+        "see you later": "나중에 봐요",
+        "thanks": "감사합니다",
+        "thank you": "감사합니다",
+        "ty": "감사합니다",
+        "yes": "네",
+        "yeah": "네",
+        "yep": "네",
+        "no": "아니요",
+        "nope": "아니요",
+        "ok": "알겠습니다",
+        "okay": "알겠습니다",
+        "lol": "ㅋㅋ",
+        "gg": "수고하셨습니다",
+        "good morning": "좋은 아침입니다",
+        "good night": "좋은 밤 되세요",
+        "welcome": "환영합니다",
+    }
+}
+
+SHORT_PHRASE_RE = re.compile(r"^(?P<prefix>\s*)(?P<body>.*?)(?P<punct>[.!?。！？…]*)\s*$", re.DOTALL)
+
+
+def get_short_phrase_override(text: str, target_lang: str) -> Optional[str]:
+    target_norm = canonical_language_code(target_lang)
+    overrides = SHORT_PHRASE_OVERRIDES.get(target_norm)
+    if not overrides:
+        return None
+
+    # Only override simple one-line short phrases. Full sentences should still
+    # go through LibreTranslate.
+    if "\n" in text or len(text.strip()) > 40:
+        return None
+
+    match = SHORT_PHRASE_RE.match(text)
+    if not match:
+        return None
+
+    prefix = match.group("prefix") or ""
+    body = " ".join((match.group("body") or "").strip().lower().split())
+    punct = match.group("punct") or ""
+
+    if body not in overrides:
+        return None
+
+    return f"{prefix}{overrides[body]}{punct}"
+
+
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Add it in your .env or environment variables.")
 
@@ -538,6 +598,10 @@ class RelayBot(commands.Bot):
 
         if source_norm == target_norm:
             return text
+
+        short_override = get_short_phrase_override(text, target_norm)
+        if short_override is not None:
+            return short_override
 
         # Preserve Discord custom emojis/mentions/timestamps by translating only
         # the normal text around them, then putting the original token back.
