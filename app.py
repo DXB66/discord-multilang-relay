@@ -1659,6 +1659,50 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
         await bot.delete_relay_record_by_target_message(message_id)
 
 
+
+async def resolve_reaction_emoji_for_mirror(emoji: discord.PartialEmoji | str):
+    """Return an emoji usable by the bot for reaction-sync.
+
+    Unicode reactions are returned unchanged. Custom emoji reactions are copied
+    into the bot application emoji cache first, so reactions from servers the bot
+    cannot access can still be mirrored.
+    """
+    if isinstance(emoji, str):
+        return emoji
+
+    emoji_id = getattr(emoji, "id", None)
+    if emoji_id is None:
+        return emoji
+
+    original_name = getattr(emoji, "name", None) or "emoji"
+    original_animated = bool(getattr(emoji, "animated", False))
+
+    try:
+        token = await bot.create_or_get_app_emoji_token(
+            original_name=original_name,
+            original_emoji_id=str(emoji_id),
+            original_animated=original_animated,
+        )
+    except Exception as exc:
+        log.warning(
+            "Could not prepare app emoji for reaction-sync :%s: (%s). Using original reaction emoji. Error: %s",
+            original_name,
+            emoji_id,
+            exc,
+        )
+        return emoji
+
+    match = CUSTOM_EMOJI_RE.fullmatch(token)
+    if not match:
+        return emoji
+
+    return discord.PartialEmoji(
+        name=match.group("name"),
+        id=int(match.group("id")),
+        animated=bool(match.group("animated")),
+    )
+
+
 async def mirror_reaction_to_linked_messages(payload: discord.RawReactionActionEvent, add: bool) -> None:
     if payload.guild_id is None:
         return
@@ -1681,6 +1725,8 @@ async def mirror_reaction_to_linked_messages(payload: discord.RawReactionActionE
     if len(related_locations) < 2:
         return
 
+    mirror_emoji = await resolve_reaction_emoji_for_mirror(payload.emoji)
+
     for channel_id, message_id in related_locations:
         if channel_id == payload.channel_id and message_id == payload.message_id:
             continue
@@ -1699,17 +1745,17 @@ async def mirror_reaction_to_linked_messages(payload: discord.RawReactionActionE
 
         try:
             if add:
-                await target_message.add_reaction(payload.emoji)
+                await target_message.add_reaction(mirror_emoji)
             else:
                 if bot.user is not None:
-                    await target_message.remove_reaction(payload.emoji, bot.user)
+                    await target_message.remove_reaction(mirror_emoji, bot.user)
         except discord.NotFound:
             pass
         except discord.Forbidden:
             log.warning(
                 "Missing permission to %s reaction %s on message %s in channel %s",
                 "add" if add else "remove",
-                payload.emoji,
+                mirror_emoji,
                 message_id,
                 channel_id,
             )
@@ -1717,7 +1763,7 @@ async def mirror_reaction_to_linked_messages(payload: discord.RawReactionActionE
             log.warning(
                 "Could not %s reaction %s on message %s in channel %s: %s",
                 "add" if add else "remove",
-                payload.emoji,
+                mirror_emoji,
                 message_id,
                 channel_id,
                 exc,
