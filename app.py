@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -47,6 +48,24 @@ DISCORD_PROTECTED_TOKEN_RE = re.compile(
     r"|<#\d{15,25}>"
     r"|<t:\d{1,12}(?::[tTdDfFR])?>"
 )
+
+CUSTOM_EMOJI_RE = re.compile(r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_]{2,32}):(?P<id>\d{15,25})>")
+ENABLE_APP_EMOJI_CACHE = os.getenv("ENABLE_APP_EMOJI_CACHE", "true").lower() in {"1", "true", "yes", "on"}
+DISCORD_API_BASE = "https://discord.com/api/v10"
+
+
+def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_]+", "_", original_name).strip("_") or "emoji"
+    suffix = str(emoji_id)[-8:]
+    prefix = "r"
+    max_base_len = max(2, 32 - len(prefix) - 1 - len(suffix))
+    safe = safe[:max_base_len].strip("_") or "emoji"
+    name = f"{prefix}_{safe}_{suffix}"
+    return name[:32]
+
+
+def app_emoji_token(name: str, emoji_id: str, animated: bool = False) -> str:
+    return f"<{'a' if animated else ''}:{name}:{emoji_id}>"
 
 
 # LibreTranslate can mistranslate very short chat phrases, especially into Korean.
@@ -303,6 +322,7 @@ class RelayBot(commands.Bot):
         self.db: Optional[aiosqlite.Connection] = None
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.webhook_cache: dict[int, discord.Webhook] = {}
+        self.app_emoji_lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -360,6 +380,16 @@ class RelayBot(commands.Bot):
                 target_index INTEGER NOT NULL,
                 PRIMARY KEY (target_message_id),
                 UNIQUE (source_message_id, target_channel_id, target_index)
+            );
+
+            CREATE TABLE IF NOT EXISTS app_emoji_cache (
+                original_emoji_id TEXT PRIMARY KEY,
+                original_name TEXT NOT NULL,
+                original_animated INTEGER NOT NULL DEFAULT 0,
+                app_emoji_id TEXT NOT NULL,
+                app_emoji_name TEXT NOT NULL,
+                app_emoji_animated INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -566,6 +596,246 @@ class RelayBot(commands.Bot):
             deduped.append(location)
 
         return deduped
+
+    async def get_application_id_for_emojis(self) -> int:
+        app_id = self.application_id
+        if app_id:
+            return int(app_id)
+
+        if self.user:
+            # For normal Discord bots, the bot user ID is the application/client ID.
+            return int(self.user.id)
+
+        raise RuntimeError("Could not determine Discord application ID for app emoji cache.")
+
+    async def discord_api_request(self, method: str, path: str, **kwargs):
+        assert self.http_session is not None
+
+        headers = kwargs.pop("headers", {})
+        headers["Authorization"] = f"Bot {BOT_TOKEN}"
+        headers["User-Agent"] = "discord-multilang-relay (app emoji cache)"
+
+        url = f"{DISCORD_API_BASE}{path}"
+
+        for attempt in range(2):
+            async with self.http_session.request(method, url, headers=headers, **kwargs) as response:
+                body = await response.text()
+
+                if response.status == 429 and attempt == 0:
+                    try:
+                        retry_after = float((await response.json()).get("retry_after", 1.0))
+                    except Exception:
+                        retry_after = 1.0
+                    await asyncio.sleep(min(max(retry_after, 0.5), 10.0))
+                    continue
+
+                if response.status >= 400:
+                    raise RuntimeError(f"Discord API error {response.status} {method} {path}: {body}")
+
+                if response.status == 204 or not body.strip():
+                    return None
+
+                return await response.json()
+
+        raise RuntimeError(f"Discord API request failed after retry: {method} {path}")
+
+    async def get_cached_app_emoji(self, original_emoji_id: str):
+        assert self.db is not None
+        cursor = await self.db.execute(
+            """
+            SELECT original_emoji_id, original_name, original_animated,
+                   app_emoji_id, app_emoji_name, app_emoji_animated
+            FROM app_emoji_cache
+            WHERE original_emoji_id = ?
+            """,
+            (str(original_emoji_id),),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row
+
+    async def set_cached_app_emoji(
+        self,
+        original_emoji_id: str,
+        original_name: str,
+        original_animated: bool,
+        app_emoji_id: str,
+        app_emoji_name: str,
+        app_emoji_animated: bool,
+    ) -> None:
+        assert self.db is not None
+        await self.db.execute(
+            """
+            INSERT INTO app_emoji_cache (
+                original_emoji_id,
+                original_name,
+                original_animated,
+                app_emoji_id,
+                app_emoji_name,
+                app_emoji_animated
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(original_emoji_id) DO UPDATE SET
+                original_name = excluded.original_name,
+                original_animated = excluded.original_animated,
+                app_emoji_id = excluded.app_emoji_id,
+                app_emoji_name = excluded.app_emoji_name,
+                app_emoji_animated = excluded.app_emoji_animated
+            """,
+            (
+                str(original_emoji_id),
+                original_name,
+                1 if original_animated else 0,
+                str(app_emoji_id),
+                app_emoji_name,
+                1 if app_emoji_animated else 0,
+            ),
+        )
+        await self.db.commit()
+
+    async def download_custom_emoji_image(self, emoji_id: str, animated: bool) -> tuple[bytes, str]:
+        assert self.http_session is not None
+
+        # GIF preserves animated emojis. WebP is best for static emojis.
+        formats = ["gif", "webp"] if animated else ["webp", "png"]
+        last_error: Optional[Exception] = None
+
+        for ext in formats:
+            url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}"
+            if ext == "webp" and animated:
+                url += "?animated=true"
+
+            try:
+                async with self.http_session.get(url) as response:
+                    body = await response.read()
+                    if response.status >= 400:
+                        raise RuntimeError(f"CDN error {response.status} while downloading emoji {emoji_id}.{ext}")
+
+                    if len(body) > 256 * 1024:
+                        raise RuntimeError(
+                            f"Emoji {emoji_id}.{ext} is {len(body)} bytes; Discord app emojis must be 256 KiB or less."
+                        )
+
+                    content_type = {
+                        "gif": "image/gif",
+                        "webp": "image/webp",
+                        "png": "image/png",
+                    }[ext]
+                    return body, content_type
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        raise RuntimeError(f"Could not download usable emoji image {emoji_id}: {last_error}")
+
+    async def find_existing_app_emoji_by_name(self, app_emoji_name: str):
+        application_id = await self.get_application_id_for_emojis()
+        data = await self.discord_api_request("GET", f"/applications/{application_id}/emojis")
+        items = data.get("items", []) if isinstance(data, dict) else []
+        for item in items:
+            if item.get("name") == app_emoji_name:
+                return item
+        return None
+
+    async def create_or_get_app_emoji_token(self, original_name: str, original_emoji_id: str, original_animated: bool) -> str:
+        if not ENABLE_APP_EMOJI_CACHE:
+            return app_emoji_token(original_name, original_emoji_id, original_animated)
+
+        cached = await self.get_cached_app_emoji(original_emoji_id)
+        if cached:
+            return app_emoji_token(
+                cached["app_emoji_name"],
+                cached["app_emoji_id"],
+                bool(cached["app_emoji_animated"]),
+            )
+
+        async with self.app_emoji_lock:
+            cached = await self.get_cached_app_emoji(original_emoji_id)
+            if cached:
+                return app_emoji_token(
+                    cached["app_emoji_name"],
+                    cached["app_emoji_id"],
+                    bool(cached["app_emoji_animated"]),
+                )
+
+            app_emoji_name = make_app_emoji_name(original_name, original_emoji_id)
+
+            try:
+                existing = await self.find_existing_app_emoji_by_name(app_emoji_name)
+                if existing:
+                    app_emoji_id = str(existing["id"])
+                    app_emoji_animated = bool(existing.get("animated", False))
+                    await self.set_cached_app_emoji(
+                        original_emoji_id,
+                        original_name,
+                        original_animated,
+                        app_emoji_id,
+                        app_emoji_name,
+                        app_emoji_animated,
+                    )
+                    return app_emoji_token(app_emoji_name, app_emoji_id, app_emoji_animated)
+
+                image_bytes, content_type = await self.download_custom_emoji_image(original_emoji_id, original_animated)
+                encoded = base64.b64encode(image_bytes).decode("ascii")
+                image_data = f"data:{content_type};base64,{encoded}"
+
+                application_id = await self.get_application_id_for_emojis()
+                created = await self.discord_api_request(
+                    "POST",
+                    f"/applications/{application_id}/emojis",
+                    json={"name": app_emoji_name, "image": image_data},
+                )
+
+                app_emoji_id = str(created["id"])
+                app_emoji_animated = bool(created.get("animated", False))
+
+                await self.set_cached_app_emoji(
+                    original_emoji_id,
+                    original_name,
+                    original_animated,
+                    app_emoji_id,
+                    app_emoji_name,
+                    app_emoji_animated,
+                )
+
+                log.info("Cached external emoji :%s: (%s) as app emoji :%s: (%s)", original_name, original_emoji_id, app_emoji_name, app_emoji_id)
+                return app_emoji_token(app_emoji_name, app_emoji_id, app_emoji_animated)
+            except Exception as exc:
+                log.warning(
+                    "Could not create app emoji cache for :%s: (%s). Keeping original token. Error: %s",
+                    original_name,
+                    original_emoji_id,
+                    exc,
+                )
+                return app_emoji_token(original_name, original_emoji_id, original_animated)
+
+    async def replace_custom_emojis_with_app_emojis(self, text: str) -> str:
+        if not text or not ENABLE_APP_EMOJI_CACHE:
+            return text
+
+        matches = list(CUSTOM_EMOJI_RE.finditer(text))
+        if not matches:
+            return text
+
+        parts: list[str] = []
+        last_index = 0
+
+        for match in matches:
+            parts.append(text[last_index:match.start()])
+            original_name = match.group("name")
+            original_emoji_id = match.group("id")
+            original_animated = bool(match.group("animated"))
+
+            replacement = await self.create_or_get_app_emoji_token(
+                original_name,
+                original_emoji_id,
+                original_animated,
+            )
+            parts.append(replacement)
+            last_index = match.end()
+
+        parts.append(text[last_index:])
+        return "".join(parts)
 
     async def delete_relay_records_for_source(self, guild_id: int, source_channel_id: int, source_message_id: int) -> None:
         assert self.db is not None
@@ -1201,6 +1471,11 @@ async def relay_to_target(
 
     if not final_content:
         return None
+
+    # Convert custom emojis from servers the bot/webhook may not be able to use
+    # into bot application-owned emoji copies. This keeps them inline instead of
+    # falling back to :emoji_name: text when possible.
+    final_content = await bot.replace_custom_emojis_with_app_emojis(final_content)
 
     try:
         webhook = await bot.get_or_create_webhook(target_channel, message.guild.id)
