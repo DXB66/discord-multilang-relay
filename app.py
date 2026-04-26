@@ -167,6 +167,163 @@ def normalize_chat_slang_for_translation(text: str, source_lang: str) -> str:
     return CHAT_SLANG_RE.sub(replace, text)
 
 
+# LibreTranslate/Argos can be weak with Arabic dialects such as Egyptian Arabic.
+# These rules convert common dialect chat phrases into clear English "pivot"
+# phrases first, then the bot translates that pivot to the target language.
+ARABIC_LETTER_RE = re.compile(r"[\u0600-\u06FF]")
+ARABIC_DIACRITICS_RE = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
+ARABIC_LINE_RE = re.compile(r"^(?P<prefix>\s*)(?P<body>.*?)(?P<punct>[.!?؟،,…]*)\s*$", re.DOTALL)
+
+ARABIC_CHAR_TRANSLATION = str.maketrans(
+    {
+        "أ": "ا",
+        "إ": "ا",
+        "آ": "ا",
+        "ٱ": "ا",
+        "ى": "ي",
+        "ئ": "ي",
+        "ؤ": "و",
+        "ة": "ه",
+        "گ": "ك",
+        "چ": "ج",
+        "پ": "ب",
+    }
+)
+
+ARABIC_DIALECT_EXACT_PIVOTS: dict[str, str] = {
+    # Greetings / "how are you?" variations.
+    "كيف حالكم": "How are you guys doing?",
+    "كيف حالكم اليوم": "How are you guys doing today?",
+    "كيف حالكم اليوم يا رفاق": "How are you guys doing today?",
+    "كيف حالكم اليوم يا شباب": "How are you guys doing today?",
+    "كيف حالكم اليوم يا جماعه": "How are you guys doing today?",
+    "كيف حالكم يا رفاق": "How are you guys doing?",
+    "كيف حالكم يا شباب": "How are you guys doing?",
+    "كيف حالكم يا جماعه": "How are you guys doing?",
+    "عاملين ايه": "How are you guys doing?",
+    "عاملين اي": "How are you guys doing?",
+    "عاملين ايه يا جماعه": "How are you guys doing?",
+    "عاملين اي يا جماعه": "How are you guys doing?",
+    "عاملين ايه يا شباب": "How are you guys doing?",
+    "عاملين اي يا شباب": "How are you guys doing?",
+    "عامل ايه": "How are you doing?",
+    "عامل اي": "How are you doing?",
+    "عامله ايه": "How are you doing?",
+    "عامله اي": "How are you doing?",
+    "ازيكم": "How are you guys doing?",
+    "ازيكو": "How are you guys doing?",
+    "ازيكوا": "How are you guys doing?",
+    "ازيكو يا شباب": "How are you guys doing?",
+    "ازيكم يا شباب": "How are you guys doing?",
+    "ازيكوا يا شباب": "How are you guys doing?",
+    "ازيكو يا جماعه": "How are you guys doing?",
+    "ازيكم يا جماعه": "How are you guys doing?",
+    "ازيكوا يا جماعه": "How are you guys doing?",
+    "ازيك يا شباب": "How are you guys doing?",
+    "ازيك يا جماعه": "How are you guys doing?",
+    "ازيك": "How are you doing?",
+    "ايه الاخبار": "What's up?",
+    "اي الاخبار": "What's up?",
+    "ايه اخبارك": "How are you doing?",
+    "اي اخبارك": "How are you doing?",
+    "ايه اخباركم": "How are you guys doing?",
+    "اي اخباركم": "How are you guys doing?",
+    "اخبارك ايه": "How are you doing?",
+    "اخباركم ايه": "How are you guys doing?",
+
+    # Common casual replies / small phrases.
+    "تمام": "I'm good.",
+    "تمام الحمد لله": "I'm good, thank God.",
+    "الحمد لله": "Thank God.",
+    "ماشي": "Okay.",
+    "معلش": "Sorry.",
+    "ولا يهمك": "No worries.",
+    "براحتك": "Take your time.",
+    "وحشتني": "I missed you.",
+    "وحشتوني": "I missed you all.",
+    "حبيبي": "My friend.",
+    "يا جماعه": "guys",
+    "يا شباب": "guys",
+}
+
+ARABIC_DIALECT_REGEX_PIVOTS: list[tuple[re.Pattern, str]] = [
+    (
+        re.compile(r"^(ازيك|ازيكم|ازيكو|ازيكوا)( يا (شباب|جماعه|ناس|رفاق|رجاله|صحاب|اصحابي|حبايب))?$"),
+        "How are you guys doing?",
+    ),
+    (
+        re.compile(r"^(عاملين ايه|عاملين اي|بتعملوا ايه|بتعملو ايه|بتعملوا اي|بتعملو اي)( يا (شباب|جماعه|ناس|رفاق|رجاله|صحاب|اصحابي|حبايب))?$"),
+        "How are you guys doing?",
+    ),
+    (
+        re.compile(r"^(عامل ايه|عامل اي|عامله ايه|عامله اي|اخبارك ايه|ايه اخبارك|اي اخبارك)$"),
+        "How are you doing?",
+    ),
+    (
+        re.compile(r"^(ايه الاخبار|اي الاخبار|ايه اخباركم|اي اخباركم|اخباركم ايه)( يا (شباب|جماعه|ناس|رفاق|رجاله|صحاب|اصحابي|حبايب))?$"),
+        "What's up?",
+    ),
+    (
+        re.compile(r"^(صباح الخير|صباحو)$"),
+        "Good morning.",
+    ),
+    (
+        re.compile(r"^(مساء الخير|مسا الخير)$"),
+        "Good evening.",
+    ),
+]
+
+
+def normalize_arabic_for_rule_matching(text: str) -> str:
+    cleaned = ARABIC_DIACRITICS_RE.sub("", text)
+    cleaned = cleaned.replace("ـ", "")
+    cleaned = cleaned.translate(ARABIC_CHAR_TRANSLATION)
+    cleaned = re.sub(r"[^\u0600-\u06FFA-Za-z0-9\s]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def normalize_arabic_output_punctuation(punct: str) -> str:
+    if not punct:
+        return ""
+    return punct.replace("؟", "?").replace("،", ",")
+
+
+def get_arabic_dialect_pivot_for_line(line: str) -> Optional[str]:
+    if not ARABIC_LETTER_RE.search(line):
+        return None
+
+    match = ARABIC_LINE_RE.match(line)
+    if not match:
+        return None
+
+    prefix = match.group("prefix") or ""
+    body = (match.group("body") or "").strip()
+    punct = normalize_arabic_output_punctuation(match.group("punct") or "")
+
+    if not body:
+        return None
+
+    key = normalize_arabic_for_rule_matching(body)
+    if not key:
+        return None
+
+    pivot = ARABIC_DIALECT_EXACT_PIVOTS.get(key)
+    if pivot is None:
+        for pattern, candidate in ARABIC_DIALECT_REGEX_PIVOTS:
+            if pattern.fullmatch(key):
+                pivot = candidate
+                break
+
+    if pivot is None:
+        return None
+
+    # Do not double punctuation if the pivot already ends with punctuation.
+    if punct and pivot[-1:] in ".!?":
+        return f"{prefix}{pivot}"
+    return f"{prefix}{pivot}{punct}"
+
+
 # LibreTranslate can mistranslate very short chat phrases, especially into Korean.
 # These exact short-phrase overrides avoid broken outputs like "이름 *" for "Hi/Bye".
 SHORT_PHRASE_OVERRIDES: dict[str, dict[str, str]] = {
@@ -936,6 +1093,53 @@ class RelayBot(commands.Bot):
         parts.append(text[last_index:])
         return "".join(parts)
 
+    async def translate_arabic_dialect_text_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
+        """Translate known Arabic/Egyptian dialect phrases through an English pivot.
+
+        This avoids bad literal translations for common dialect lines like
+        "ازيك يا شباب" or "عاملين ايه يا جماعة" while keeping normal Arabic
+        text on the regular LibreTranslate path.
+        """
+        if canonical_language_code(source_norm).split("-", 1)[0] != "ar":
+            return None
+
+        if not ARABIC_LETTER_RE.search(text):
+            return None
+
+        parts = text.splitlines(keepends=True)
+        if not parts:
+            return None
+
+        translated_parts: list[str] = []
+        changed_any = False
+
+        for part in parts:
+            line = part.rstrip("\r\n")
+            newline = part[len(line):]
+
+            if not line.strip():
+                translated_parts.append(part)
+                continue
+
+            pivot = get_arabic_dialect_pivot_for_line(line)
+            if pivot is None:
+                # Keep unmatched Arabic text on the normal Arabic translation path.
+                translated_parts.append(await self.translate_text(line, source_norm, target_norm))
+                translated_parts.append(newline)
+                continue
+
+            changed_any = True
+            if canonical_language_code(target_norm).split("-", 1)[0] == "en":
+                translated_parts.append(pivot)
+            else:
+                translated_parts.append(await self.translate_text(pivot, "en", target_norm))
+            translated_parts.append(newline)
+
+        if not changed_any:
+            return None
+
+        return "".join(translated_parts)
+
     async def delete_relay_records_for_source(self, guild_id: int, source_channel_id: int, source_message_id: int) -> None:
         assert self.db is not None
         await self.db.execute(
@@ -999,6 +1203,10 @@ class RelayBot(commands.Bot):
                     translated_parts.append(after)
 
             return "".join(translated_parts)
+
+        arabic_dialect_translation = await self.translate_arabic_dialect_text_if_needed(text, source_norm, target_norm)
+        if arabic_dialect_translation is not None:
+            return arabic_dialect_translation
 
         text = normalize_chat_slang_for_translation(text, source_norm)
 
