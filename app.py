@@ -1110,33 +1110,46 @@ class RelayBot(commands.Bot):
         if not parts:
             return None
 
-        translated_parts: list[str] = []
-        changed_any = False
+        # Only take the dialect override path when every non-empty line matches
+        # a known dialect rule. If any line is normal Arabic, return None and let
+        # the regular LibreTranslate Arabic path handle the whole text. This also
+        # avoids recursive calls back into translate_text for unmatched lines.
+        pivot_parts: list[tuple[str, str]] = []
+        blank_parts: dict[int, str] = {}
 
-        for part in parts:
+        for index, part in enumerate(parts):
             line = part.rstrip("\r\n")
             newline = part[len(line):]
 
             if not line.strip():
-                translated_parts.append(part)
+                blank_parts[index] = part
                 continue
 
             pivot = get_arabic_dialect_pivot_for_line(line)
             if pivot is None:
-                # Keep unmatched Arabic text on the normal Arabic translation path.
-                translated_parts.append(await self.translate_text(line, source_norm, target_norm))
-                translated_parts.append(newline)
+                return None
+
+            pivot_parts.append((pivot, newline))
+
+        if not pivot_parts:
+            return None
+
+        translated_parts: list[str] = []
+        pivot_index = 0
+
+        for index, part in enumerate(parts):
+            if index in blank_parts:
+                translated_parts.append(blank_parts[index])
                 continue
 
-            changed_any = True
+            pivot, newline = pivot_parts[pivot_index]
+            pivot_index += 1
+
             if canonical_language_code(target_norm).split("-", 1)[0] == "en":
                 translated_parts.append(pivot)
             else:
                 translated_parts.append(await self.translate_text(pivot, "en", target_norm))
             translated_parts.append(newline)
-
-        if not changed_any:
-            return None
 
         return "".join(translated_parts)
 
@@ -1168,6 +1181,14 @@ class RelayBot(commands.Bot):
 
         source_norm = canonical_language_code(source_lang)
         target_norm = canonical_language_code(target_lang)
+
+        # If someone writes Arabic text in the "wrong" linked channel, do not
+        # force LibreTranslate to treat that Arabic as the channel language
+        # (for example, Arabic text in an English channel). That can produce
+        # random/garbled output. Treat Arabic-script text as Arabic instead.
+        if ARABIC_LETTER_RE.search(text) and source_norm.split("-", 1)[0] != "ar":
+            source_norm = "ar"
+            source_lang = "ar"
 
         if source_norm == target_norm:
             return text
