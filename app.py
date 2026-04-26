@@ -36,17 +36,28 @@ NO_DROP_FALLBACK = os.getenv("NO_DROP_FALLBACK", "true").lower() in {"1", "true"
 FALLBACK_PREFIX_TEMPLATE = os.getenv("FALLBACK_PREFIX_TEMPLATE", "[{source}] ")
 TRANSLATE_CHUNK_LIMIT = max(200, int(os.getenv("TRANSLATE_CHUNK_LIMIT", "1200")))
 DISCORD_MESSAGE_LIMIT = max(500, int(os.getenv("DISCORD_MESSAGE_LIMIT", "2000")))
-# Protect Discord-only syntax from translation engines.
+# Protect syntax/items that translation engines should never translate.
 # Examples:
 # - custom emojis: <:catglare:1485998314796089476>, <a:dance:123456789012345678>
+# - plain Discord-style emoji names: :smile:, :catglare:
+# - normal Unicode emojis: 👉👈, 😂, ❤️
 # - mentions/channels/roles: <@123>, <@!123>, <#123>, <@&123>
 # - Discord timestamps: <t:1700000000:R>
+UNICODE_EMOJI_PATTERN = (
+    "[\U0001F1E6-\U0001F1FF]{2}"
+    "|[\U0001F300-\U0001FAFF][\uFE0F\uFE0E]?(?:\u200D[\U0001F300-\U0001FAFF][\uFE0F\uFE0E]?)*"
+    "|[\u2600-\u27BF]\uFE0F?"
+)
+COLON_EMOJI_PATTERN = r":[A-Za-z0-9_]{2,32}:"
+
 DISCORD_PROTECTED_TOKEN_RE = re.compile(
     r"<a?:[A-Za-z0-9_]{2,32}:\d{15,25}>"
     r"|<@!?\d{15,25}>"
     r"|<@&\d{15,25}>"
     r"|<#\d{15,25}>"
     r"|<t:\d{1,12}(?::[tTdDfFR])?>"
+    r"|" + COLON_EMOJI_PATTERN +
+    r"|" + UNICODE_EMOJI_PATTERN
 )
 
 CUSTOM_EMOJI_RE = re.compile(r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_]{2,32}):(?P<id>\d{15,25})>")
@@ -66,6 +77,64 @@ def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
 
 def app_emoji_token(name: str, emoji_id: str, animated: bool = False) -> str:
     return f"<{'a' if animated else ''}:{name}:{emoji_id}>"
+
+
+CHAT_SLANG_REPLACEMENTS: dict[str, str] = {
+    "u": "you",
+    "ur": "your",
+    "r": "are",
+    "pls": "please",
+    "plz": "please",
+    "ty": "thank you",
+    "thx": "thanks",
+    "thanx": "thanks",
+    "idk": "I don't know",
+    "imo": "in my opinion",
+    "rn": "right now",
+    "btw": "by the way",
+    "ppl": "people",
+    "msg": "message",
+    "cuz": "because",
+    "coz": "because",
+    "bc": "because",
+    "bcs": "because",
+    "wanna": "want to",
+    "gonna": "going to",
+    "gotta": "have to",
+    "lemme": "let me",
+    "kinda": "kind of",
+    "tho": "though",
+    "tbh": "to be honest",
+}
+
+CHAT_SLANG_RE = re.compile(
+    r"\b(" + "|".join(re.escape(key) for key in sorted(CHAT_SLANG_REPLACEMENTS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def match_case_replacement(original: str, replacement: str) -> str:
+    if original.isupper():
+        return replacement.upper()
+    if original[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def normalize_chat_slang_for_translation(text: str, source_lang: str) -> str:
+    # Only normalize common English chat slang before sending text to LibreTranslate.
+    # This helps casual messages like "Hope u like..." translate correctly.
+    if canonical_language_code(source_lang).split("-", 1)[0] != "en":
+        return text
+
+    def replace(match: re.Match) -> str:
+        original = match.group(0)
+        replacement = CHAT_SLANG_REPLACEMENTS.get(original.lower())
+        if not replacement:
+            return original
+        return match_case_replacement(original, replacement)
+
+    return CHAT_SLANG_RE.sub(replace, text)
 
 
 # LibreTranslate can mistranslate very short chat phrases, especially into Korean.
@@ -900,6 +969,8 @@ class RelayBot(commands.Bot):
                     translated_parts.append(after)
 
             return "".join(translated_parts)
+
+        text = normalize_chat_slang_for_translation(text, source_norm)
 
         # LibreTranslate's direct Traditional Chinese target model can produce
         # repeated/garbled output. Translate to Simplified Chinese first, then
