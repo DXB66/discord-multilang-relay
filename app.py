@@ -206,6 +206,23 @@ ARABIC_DIALECT_EXACT_PIVOTS: dict[str, str] = {
     "عاملين اي يا جماعه": "How are you guys doing?",
     "عاملين ايه يا شباب": "How are you guys doing?",
     "عاملين اي يا شباب": "How are you guys doing?",
+    "عاملين ايه النهارده": "How are you guys doing today?",
+    "عاملين اي النهارده": "How are you guys doing today?",
+    "عاملين ايه اليوم": "How are you guys doing today?",
+    "عاملين اي اليوم": "How are you guys doing today?",
+    "عاملين ايه يا جماعه النهارده": "How are you guys doing today?",
+    "عاملين اي يا جماعه النهارده": "How are you guys doing today?",
+    "عاملين ايه يا شباب النهارده": "How are you guys doing today?",
+    "عاملين اي يا شباب النهارده": "How are you guys doing today?",
+    "ازيكم يا جماعه عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيكم يا جماعه عاملين اي النهارده": "How are you guys doing today?",
+    "ازيكو يا جماعه عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيكوا يا جماعه عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيك يا جماعه عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيكم يا شباب عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيكو يا شباب عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيكوا يا شباب عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيك يا شباب عاملين ايه النهارده": "How are you guys doing today?",
     "عامل ايه": "How are you doing?",
     "عامل اي": "How are you doing?",
     "عامله ايه": "How are you doing?",
@@ -252,8 +269,20 @@ ARABIC_DIALECT_REGEX_PIVOTS: list[tuple[re.Pattern, str]] = [
         "How are you guys doing?",
     ),
     (
-        re.compile(r"^(عاملين ايه|عاملين اي|بتعملوا ايه|بتعملو ايه|بتعملوا اي|بتعملو اي)( يا (شباب|جماعه|ناس|رفاق|رجاله|صحاب|اصحابي|حبايب))?$"),
-        "How are you guys doing?",
+        re.compile(
+            r"^(ازيك|ازيكم|ازيكو|ازيكوا)( يا (شباب|جماعه|ناس|رفاق|رجاله|صحاب|اصحابي|حبايب))? "
+            r"(عاملين ايه|عاملين اي|بتعملوا ايه|بتعملو ايه|بتعملوا اي|بتعملو اي)"
+            r"( (النهارده|انهارده|اليوم|دلوقتي))?$"
+        ),
+        "How are you guys doing today?",
+    ),
+    (
+        re.compile(
+            r"^(عاملين ايه|عاملين اي|بتعملوا ايه|بتعملو ايه|بتعملوا اي|بتعملو اي)"
+            r"( يا (شباب|جماعه|ناس|رفاق|رجاله|صحاب|اصحابي|حبايب))?"
+            r"( (النهارده|انهارده|اليوم|دلوقتي))?$"
+        ),
+        "How are you guys doing today?",
     ),
     (
         re.compile(r"^(عامل ايه|عامل اي|عامله ايه|عامله اي|اخبارك ايه|ايه اخبارك|اي اخبارك)$"),
