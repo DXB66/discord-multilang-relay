@@ -43,11 +43,13 @@ DISCORD_MESSAGE_LIMIT = max(500, int(os.getenv("DISCORD_MESSAGE_LIMIT", "2000"))
 # - normal Unicode emojis: 👉👈, 😂, ❤️
 # - mentions/channels/roles: <@123>, <@!123>, <#123>, <@&123>
 # - Discord timestamps: <t:1700000000:R>
-UNICODE_EMOJI_PATTERN = (
+UNICODE_EMOJI_UNIT_PATTERN = (
     "[\U0001F1E6-\U0001F1FF]{2}"
     "|[\U0001F300-\U0001FAFF][\uFE0F\uFE0E]?(?:\u200D[\U0001F300-\U0001FAFF][\uFE0F\uFE0E]?)*"
     "|[\u2600-\u27BF]\uFE0F?"
 )
+# Match adjacent emoji as one unit, e.g. 👉👈, so RTL languages do not reorder them.
+UNICODE_EMOJI_PATTERN = f"(?:{UNICODE_EMOJI_UNIT_PATTERN})+"
 COLON_EMOJI_PATTERN = r":[A-Za-z0-9_]{2,32}:"
 
 DISCORD_PROTECTED_TOKEN_RE = re.compile(
@@ -77,6 +79,34 @@ def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
 
 def app_emoji_token(name: str, emoji_id: str, animated: bool = False) -> str:
     return f"<{'a' if animated else ''}:{name}:{emoji_id}>"
+
+
+RTL_LANGUAGE_BASES = {"ar", "he", "fa", "ur"}
+LTR_ISOLATE = "\u2066"
+POP_DIRECTIONAL_ISOLATE = "\u2069"
+
+
+def is_rtl_language_code(code: str) -> bool:
+    return canonical_language_code(code).split("-", 1)[0] in RTL_LANGUAGE_BASES
+
+
+def should_direction_wrap_token(token: str) -> bool:
+    return (
+        CUSTOM_EMOJI_RE.fullmatch(token) is not None
+        or re.fullmatch(COLON_EMOJI_PATTERN, token) is not None
+        or re.fullmatch(UNICODE_EMOJI_PATTERN, token) is not None
+    )
+
+
+def wrap_protected_token_for_target(token: str, target_lang: str) -> str:
+    # Discord/Unicode RTL rendering can visually reverse emoji clusters like 👉👈
+    # around Arabic text. LTR isolate keeps the emoji/token order stable without
+    # changing the visible text.
+    if not is_rtl_language_code(target_lang):
+        return token
+    if not should_direction_wrap_token(token):
+        return token
+    return f"{LTR_ISOLATE}{token}{POP_DIRECTIONAL_ISOLATE}"
 
 
 CHAT_SLANG_REPLACEMENTS: dict[str, str] = {
@@ -958,7 +988,7 @@ class RelayBot(commands.Bot):
                     else:
                         translated_parts.append(before)
 
-                translated_parts.append(match.group(0))
+                translated_parts.append(wrap_protected_token_for_target(match.group(0), target_norm))
                 last_index = match.end()
 
             after = text[last_index:]
