@@ -128,6 +128,19 @@ def wrap_protected_token_for_target(token: str, target_lang: str) -> str:
     return f"{LTR_ISOLATE}{token}{POP_DIRECTIONAL_ISOLATE}"
 
 
+def normalize_translated_output_for_target(text: str, target_lang: str) -> str:
+    # LibreTranslate sometimes returns duplicated punctuation for Arabic, e.g.
+    # "??" or "؟؟" after a translated question. Collapse those to one Arabic
+    # question mark without touching normal text.
+    if canonical_language_code(target_lang).split("-", 1)[0] != "ar":
+        return text
+
+    # Only collapse repeated question punctuation. This avoids changing normal
+    # protected links that may contain a single ? in the URL query string.
+    text = re.sub(r"[؟?]{2,}", "؟", text)
+    return text
+
+
 CHAT_SLANG_REPLACEMENTS: dict[str, str] = {
     "u": "you",
     "ur": "your",
@@ -1446,7 +1459,7 @@ class RelayBot(commands.Bot):
                 else:
                     translated_parts.append(after)
 
-            return "".join(translated_parts)
+            return normalize_translated_output_for_target("".join(translated_parts), target_norm)
 
         arabic_ai_translation = await self.translate_arabic_with_ai_if_needed(text, source_norm, target_norm)
         if arabic_ai_translation is not None:
@@ -1529,7 +1542,7 @@ class RelayBot(commands.Bot):
         if target_is_traditional:
             return simplified_to_traditional(translated_text)
 
-        return translated_text
+        return normalize_translated_output_for_target(translated_text, target_norm)
 
     async def get_languages(self) -> list[dict]:
         assert self.http_session is not None
