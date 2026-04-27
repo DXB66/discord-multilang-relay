@@ -82,6 +82,18 @@ ARABIC_AI_NUM_PREDICT = max(80, int(os.getenv("ARABIC_AI_NUM_PREDICT", "260")))
 ARABIC_AI_KEEP_ALIVE = os.getenv("ARABIC_AI_KEEP_ALIVE", "30m")
 ARABIC_AI_WARMUP_ON_START = os.getenv("ARABIC_AI_WARMUP_ON_START", "true").lower() in {"1", "true", "yes", "on"}
 
+# Optional local AI helper for Korean translation quality.
+# Reuses the same Ollama/Aya model by default. This fixes weak LibreTranslate
+# Korean results such as "idiot" becoming unrelated words.
+ENABLE_KOREAN_AI_TRANSLATION = os.getenv("ENABLE_KOREAN_AI_TRANSLATION", "false").lower() in {"1", "true", "yes", "on"}
+KOREAN_AI_URL = os.getenv("KOREAN_AI_URL", ARABIC_AI_URL)
+KOREAN_AI_MODEL = os.getenv("KOREAN_AI_MODEL", ARABIC_AI_MODEL)
+KOREAN_AI_TIMEOUT = max(10.0, float(os.getenv("KOREAN_AI_TIMEOUT", str(ARABIC_AI_TIMEOUT))))
+KOREAN_AI_MAX_CHARS = max(100, int(os.getenv("KOREAN_AI_MAX_CHARS", "800")))
+KOREAN_AI_NUM_PREDICT = max(80, int(os.getenv("KOREAN_AI_NUM_PREDICT", "220")))
+KOREAN_AI_KEEP_ALIVE = os.getenv("KOREAN_AI_KEEP_ALIVE", ARABIC_AI_KEEP_ALIVE)
+KOREAN_AI_WARMUP_ON_START = os.getenv("KOREAN_AI_WARMUP_ON_START", "true").lower() in {"1", "true", "yes", "on"}
+
 
 def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_]+", "_", original_name).strip("_") or "emoji"
@@ -203,6 +215,7 @@ def normalize_chat_slang_for_translation(text: str, source_lang: str) -> str:
 # These rules convert common dialect chat phrases into clear English "pivot"
 # phrases first, then the bot translates that pivot to the target language.
 ARABIC_LETTER_RE = re.compile(r"[\u0600-\u06FF]")
+KOREAN_LETTER_RE = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 ARABIC_DIACRITICS_RE = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
 ARABIC_LINE_RE = re.compile(r"^(?P<prefix>\s*)(?P<body>.*?)(?P<punct>[.!?؟،,…]*)\s*$", re.DOTALL)
 
@@ -664,6 +677,8 @@ class RelayBot(commands.Bot):
         self.app_emoji_lock = asyncio.Lock()
         self.arabic_ai_lock = asyncio.Lock()
         self.arabic_ai_pivot_cache: dict[str, str] = {}
+        self.korean_ai_lock = asyncio.Lock()
+        self.korean_ai_cache: dict[tuple[str, str, str], str] = {}
 
     async def setup_hook(self) -> None:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -676,6 +691,10 @@ class RelayBot(commands.Bot):
 
         if ENABLE_ARABIC_AI_TRANSLATION and ARABIC_AI_WARMUP_ON_START:
             asyncio.create_task(self.warmup_arabic_ai_model())
+
+        if ENABLE_KOREAN_AI_TRANSLATION and KOREAN_AI_WARMUP_ON_START:
+            # Same model as Arabic by default. This keeps Aya warm for Korean too.
+            asyncio.create_task(self.warmup_korean_ai_model())
 
         synced = await self.tree.sync()
         log.info(
@@ -1209,6 +1228,33 @@ class RelayBot(commands.Bot):
         except Exception as exc:
             log.warning("Arabic AI model warmup failed. The bot will still fallback normally. Error: %s", exc)
 
+    async def warmup_korean_ai_model(self) -> None:
+        """Preload the local Ollama model so Korean AI translations are faster."""
+        await asyncio.sleep(3)
+
+        if not ENABLE_KOREAN_AI_TRANSLATION:
+            return
+
+        assert self.http_session is not None
+
+        payload = {
+            "model": KOREAN_AI_MODEL,
+            "stream": False,
+            "keep_alive": KOREAN_AI_KEEP_ALIVE,
+            "prompt": "",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=min(max(KOREAN_AI_TIMEOUT, 10.0), 60.0))
+
+        try:
+            async with self.http_session.post(KOREAN_AI_URL, json=payload, timeout=timeout) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"Ollama warmup error {response.status}: {body}")
+            log.info("Korean AI model warmup requested for %s with keep_alive=%s.", KOREAN_AI_MODEL, KOREAN_AI_KEEP_ALIVE)
+        except Exception as exc:
+            log.warning("Korean AI model warmup failed. The bot will still fallback normally. Error: %s", exc)
+
     def clean_arabic_ai_response(self, response_text: str) -> str:
         cleaned = response_text.strip()
 
@@ -1329,6 +1375,140 @@ class RelayBot(commands.Bot):
 
         return await self.translate_text(english_pivot, "en", target_norm)
 
+    async def get_korean_ai_translation(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
+        """Use local Ollama/Aya for Korean-related translation.
+
+        This is used for:
+        - Korean source messages -> English pivot
+        - Any source language -> Korean target
+        """
+        cleaned_text = text.strip()
+        if not ENABLE_KOREAN_AI_TRANSLATION:
+            return None
+
+        if not cleaned_text:
+            return None
+
+        source_base = canonical_language_code(source_norm).split("-", 1)[0]
+        target_base = canonical_language_code(target_norm).split("-", 1)[0]
+
+        if source_base != "ko" and target_base != "ko":
+            return None
+
+        if source_base == target_base:
+            return None
+
+        if len(cleaned_text) > KOREAN_AI_MAX_CHARS:
+            log.info(
+                "Korean AI helper skipped message because it is too long (%s > %s chars).",
+                len(cleaned_text),
+                KOREAN_AI_MAX_CHARS,
+            )
+            return None
+
+        # Do not run Korean-source mode unless the text actually contains Hangul.
+        # English -> Korean and other languages -> Korean do not need Hangul in source.
+        if source_base == "ko" and not KOREAN_LETTER_RE.search(cleaned_text):
+            return None
+
+        if source_base == "ko":
+            target_language_name = "natural English"
+            prompt_task = (
+                "Translate the Korean Discord chat message into natural English. "
+                "Preserve line breaks, names, mentions, links, numbers, and emoji text. "
+                "Return only the English translation with no explanation."
+            )
+            cache_target = "en"
+        else:
+            target_language_name = "natural Korean"
+            prompt_task = (
+                "Translate the Discord chat message into natural Korean. "
+                "Preserve line breaks, names, mentions, links, numbers, and emoji text. "
+                "Use casual but clear Korean suitable for Discord chat. "
+                "Return only the Korean translation with no explanation."
+            )
+            cache_target = "ko"
+
+        cache_key = (source_base, cache_target, cleaned_text)
+        cached = self.korean_ai_cache.get(cache_key)
+        if cached:
+            return cached
+
+        async with self.korean_ai_lock:
+            cached = self.korean_ai_cache.get(cache_key)
+            if cached:
+                return cached
+
+            assert self.http_session is not None
+
+            prompt = (
+                "You are a professional Discord chat translator. "
+                f"{prompt_task}\n\n"
+                f"{cleaned_text}"
+            )
+
+            payload = {
+                "model": KOREAN_AI_MODEL,
+                "stream": False,
+                "keep_alive": KOREAN_AI_KEEP_ALIVE,
+                "options": {
+                    "temperature": 0,
+                    "num_predict": KOREAN_AI_NUM_PREDICT,
+                },
+                "prompt": prompt,
+            }
+
+            timeout = aiohttp.ClientTimeout(total=KOREAN_AI_TIMEOUT)
+
+            try:
+                async with self.http_session.post(KOREAN_AI_URL, json=payload, timeout=timeout) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        raise RuntimeError(f"Ollama Korean AI error {response.status}: {body}")
+
+                    data = await response.json()
+                    response_text = data.get("response")
+                    if not response_text:
+                        raise RuntimeError(f"Unexpected Ollama Korean AI response: {data}")
+
+                    translated = self.clean_arabic_ai_response(str(response_text))
+                    if not translated:
+                        raise RuntimeError("Ollama Korean AI returned an empty translation.")
+
+                    if len(self.korean_ai_cache) > 256:
+                        self.korean_ai_cache.clear()
+                    self.korean_ai_cache[cache_key] = translated
+
+                    log.info("Korean AI helper translated %s -> %s.", source_base, cache_target)
+                    return translated
+            except Exception as exc:
+                log.warning("Korean AI helper failed; falling back to LibreTranslate. Error: %s", exc)
+                return None
+
+    async def translate_korean_with_ai_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
+        source_base = canonical_language_code(source_norm).split("-", 1)[0]
+        target_base = canonical_language_code(target_norm).split("-", 1)[0]
+
+        if source_base != "ko" and target_base != "ko":
+            return None
+
+        if source_base == target_base:
+            return None
+
+        korean_ai_translation = await self.get_korean_ai_translation(text, source_norm, target_norm)
+        if not korean_ai_translation:
+            return None
+
+        # Korean source goes to English first. If the final target is not English,
+        # continue from that English pivot through the normal translator path.
+        if source_base == "ko":
+            if target_base == "en":
+                return korean_ai_translation
+            return await self.translate_text(korean_ai_translation, "en", target_norm)
+
+        # Any non-Korean source directly to Korean.
+        return korean_ai_translation
+
     async def translate_arabic_dialect_text_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
         """Translate known Arabic/Egyptian dialect phrases through an English pivot.
 
@@ -1426,6 +1606,11 @@ class RelayBot(commands.Bot):
             source_norm = "ar"
             source_lang = "ar"
 
+        # Same protection for Korean text posted in the wrong linked channel.
+        if KOREAN_LETTER_RE.search(text) and source_norm.split("-", 1)[0] != "ko":
+            source_norm = "ko"
+            source_lang = "ko"
+
         if source_norm == target_norm:
             return text
 
@@ -1468,6 +1653,10 @@ class RelayBot(commands.Bot):
         arabic_dialect_translation = await self.translate_arabic_dialect_text_if_needed(text, source_norm, target_norm)
         if arabic_dialect_translation is not None:
             return arabic_dialect_translation
+
+        korean_ai_translation = await self.translate_korean_with_ai_if_needed(text, source_norm, target_norm)
+        if korean_ai_translation is not None:
+            return korean_ai_translation
 
         text = normalize_chat_slang_for_translation(text, source_norm)
 
