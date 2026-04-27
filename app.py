@@ -70,6 +70,18 @@ CUSTOM_EMOJI_RE = re.compile(r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_]{2,32}):(?
 ENABLE_APP_EMOJI_CACHE = os.getenv("ENABLE_APP_EMOJI_CACHE", "true").lower() in {"1", "true", "yes", "on"}
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
+# Optional local AI helper for Arabic dialect translation.
+# This is self-hosted through Ollama, so it has no paid API/character quota.
+# Keep it disabled until the ollama container is reachable from the bot container.
+ENABLE_ARABIC_AI_TRANSLATION = os.getenv("ENABLE_ARABIC_AI_TRANSLATION", "false").lower() in {"1", "true", "yes", "on"}
+ARABIC_AI_URL = os.getenv("ARABIC_AI_URL", "http://ollama:11434/api/generate")
+ARABIC_AI_MODEL = os.getenv("ARABIC_AI_MODEL", "aya-expanse:8b")
+ARABIC_AI_TIMEOUT = max(10.0, float(os.getenv("ARABIC_AI_TIMEOUT", "45")))
+ARABIC_AI_MAX_CHARS = max(100, int(os.getenv("ARABIC_AI_MAX_CHARS", "800")))
+ARABIC_AI_NUM_PREDICT = max(80, int(os.getenv("ARABIC_AI_NUM_PREDICT", "260")))
+ARABIC_AI_KEEP_ALIVE = os.getenv("ARABIC_AI_KEEP_ALIVE", "30m")
+ARABIC_AI_WARMUP_ON_START = os.getenv("ARABIC_AI_WARMUP_ON_START", "true").lower() in {"1", "true", "yes", "on"}
+
 
 def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_]+", "_", original_name).strip("_") or "emoji"
@@ -95,11 +107,14 @@ def is_rtl_language_code(code: str) -> bool:
 
 
 def should_direction_wrap_token(token: str) -> bool:
-    return (
-        CUSTOM_EMOJI_RE.fullmatch(token) is not None
-        or re.fullmatch(COLON_EMOJI_PATTERN, token) is not None
-        or re.fullmatch(UNICODE_EMOJI_PATTERN, token) is not None
-    )
+    # Only wrap normal Unicode emoji clusters for RTL targets.
+    #
+    # Discord custom/app emojis like <:name:id> should NOT be wrapped with
+    # invisible direction marks. Those hidden marks can make Discord render
+    # emoji-only custom emoji messages as small inline emojis in Arabic channels.
+    # Custom emojis are parsed by Discord before display, so they do not need
+    # LTR isolate wrapping.
+    return re.fullmatch(UNICODE_EMOJI_PATTERN, token) is not None
 
 
 def wrap_protected_token_for_target(token: str, target_lang: str) -> str:
@@ -169,6 +184,192 @@ def normalize_chat_slang_for_translation(text: str, source_lang: str) -> str:
         return match_case_replacement(original, replacement)
 
     return CHAT_SLANG_RE.sub(replace, text)
+
+
+# LibreTranslate/Argos can be weak with Arabic dialects such as Egyptian Arabic.
+# These rules convert common dialect chat phrases into clear English "pivot"
+# phrases first, then the bot translates that pivot to the target language.
+ARABIC_LETTER_RE = re.compile(r"[\u0600-\u06FF]")
+ARABIC_DIACRITICS_RE = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
+ARABIC_LINE_RE = re.compile(r"^(?P<prefix>\s*)(?P<body>.*?)(?P<punct>[.!?؟،,…]*)\s*$", re.DOTALL)
+
+ARABIC_CHAR_TRANSLATION = str.maketrans(
+    {
+        "أ": "ا",
+        "إ": "ا",
+        "آ": "ا",
+        "ٱ": "ا",
+        "ى": "ي",
+        "ئ": "ي",
+        "ؤ": "و",
+        "ة": "ه",
+        "گ": "ك",
+        "چ": "ج",
+        "پ": "ب",
+    }
+)
+
+ARABIC_DIALECT_EXACT_PIVOTS: dict[str, str] = {
+    # Greetings / "how are you?" variations.
+    "كيف حالكم": "How are you guys doing?",
+    "كيف حالكم اليوم": "How are you guys doing today?",
+    "كيف حالكم اليوم يا رفاق": "How are you guys doing today?",
+    "كيف حالكم اليوم يا شباب": "How are you guys doing today?",
+    "كيف حالكم اليوم يا جماعه": "How are you guys doing today?",
+    "كيف حالكم يا رفاق": "How are you guys doing?",
+    "كيف حالكم يا شباب": "How are you guys doing?",
+    "كيف حالكم يا جماعه": "How are you guys doing?",
+    "عاملين ايه": "How are you guys doing?",
+    "عاملين اي": "How are you guys doing?",
+    "عاملين ايه يا جماعه": "How are you guys doing?",
+    "عاملين اي يا جماعه": "How are you guys doing?",
+    "عاملين ايه يا شباب": "How are you guys doing?",
+    "عاملين اي يا شباب": "How are you guys doing?",
+    "عاملين ايه النهارده": "How are you guys doing today?",
+    "عاملين اي النهارده": "How are you guys doing today?",
+    "عاملين ايه اليوم": "How are you guys doing today?",
+    "عاملين اي اليوم": "How are you guys doing today?",
+    "عاملين ايه يا جماعه النهارده": "How are you guys doing today?",
+    "عاملين اي يا جماعه النهارده": "How are you guys doing today?",
+    "عاملين ايه يا شباب النهارده": "How are you guys doing today?",
+    "عاملين اي يا شباب النهارده": "How are you guys doing today?",
+    "ازيكم يا جماعه عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيكم يا جماعه عاملين اي النهارده": "How are you guys doing today?",
+    "ازيكو يا جماعه عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيكوا يا جماعه عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيك يا جماعه عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيكم يا شباب عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيكو يا شباب عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيكوا يا شباب عاملين ايه النهارده": "How are you guys doing today?",
+    "ازيك يا شباب عاملين ايه النهارده": "How are you guys doing today?",
+    "عامل ايه": "How are you doing?",
+    "عامل اي": "How are you doing?",
+    "عامله ايه": "How are you doing?",
+    "عامله اي": "How are you doing?",
+    "ازيكم": "How are you guys doing?",
+    "ازيكو": "How are you guys doing?",
+    "ازيكوا": "How are you guys doing?",
+    "ازيكو يا شباب": "How are you guys doing?",
+    "ازيكم يا شباب": "How are you guys doing?",
+    "ازيكوا يا شباب": "How are you guys doing?",
+    "ازيكو يا جماعه": "How are you guys doing?",
+    "ازيكم يا جماعه": "How are you guys doing?",
+    "ازيكوا يا جماعه": "How are you guys doing?",
+    "ازيك يا شباب": "How are you guys doing?",
+    "ازيك يا جماعه": "How are you guys doing?",
+    "ازيك": "How are you doing?",
+    "ايه الاخبار": "What's up?",
+    "اي الاخبار": "What's up?",
+    "ايه اخبارك": "How are you doing?",
+    "اي اخبارك": "How are you doing?",
+    "ايه اخباركم": "How are you guys doing?",
+    "اي اخباركم": "How are you guys doing?",
+    "اخبارك ايه": "How are you doing?",
+    "اخباركم ايه": "How are you guys doing?",
+
+    # Common casual replies / small phrases.
+    "تمام": "I'm good.",
+    "تمام الحمد لله": "I'm good, thank God.",
+    "الحمد لله": "Thank God.",
+    "ماشي": "Okay.",
+    "معلش": "Sorry.",
+    "ولا يهمك": "No worries.",
+    "براحتك": "Take your time.",
+    "وحشتني": "I missed you.",
+    "وحشتوني": "I missed you all.",
+    "حبيبي": "My friend.",
+    "يا جماعه": "guys",
+    "يا شباب": "guys",
+}
+
+ARABIC_DIALECT_REGEX_PIVOTS: list[tuple[re.Pattern, str]] = [
+    (
+        re.compile(r"^(ازيك|ازيكم|ازيكو|ازيكوا)( يا (شباب|جماعه|ناس|رفاق|رجاله|صحاب|اصحابي|حبايب))?$"),
+        "How are you guys doing?",
+    ),
+    (
+        re.compile(
+            r"^(ازيك|ازيكم|ازيكو|ازيكوا)( يا (شباب|جماعه|ناس|رفاق|رجاله|صحاب|اصحابي|حبايب))? "
+            r"(عاملين ايه|عاملين اي|بتعملوا ايه|بتعملو ايه|بتعملوا اي|بتعملو اي)"
+            r"( (النهارده|انهارده|اليوم|دلوقتي))?$"
+        ),
+        "How are you guys doing today?",
+    ),
+    (
+        re.compile(
+            r"^(عاملين ايه|عاملين اي|بتعملوا ايه|بتعملو ايه|بتعملوا اي|بتعملو اي)"
+            r"( يا (شباب|جماعه|ناس|رفاق|رجاله|صحاب|اصحابي|حبايب))?"
+            r"( (النهارده|انهارده|اليوم|دلوقتي))?$"
+        ),
+        "How are you guys doing today?",
+    ),
+    (
+        re.compile(r"^(عامل ايه|عامل اي|عامله ايه|عامله اي|اخبارك ايه|ايه اخبارك|اي اخبارك)$"),
+        "How are you doing?",
+    ),
+    (
+        re.compile(r"^(ايه الاخبار|اي الاخبار|ايه اخباركم|اي اخباركم|اخباركم ايه)( يا (شباب|جماعه|ناس|رفاق|رجاله|صحاب|اصحابي|حبايب))?$"),
+        "What's up?",
+    ),
+    (
+        re.compile(r"^(صباح الخير|صباحو)$"),
+        "Good morning.",
+    ),
+    (
+        re.compile(r"^(مساء الخير|مسا الخير)$"),
+        "Good evening.",
+    ),
+]
+
+
+def normalize_arabic_for_rule_matching(text: str) -> str:
+    cleaned = ARABIC_DIACRITICS_RE.sub("", text)
+    cleaned = cleaned.replace("ـ", "")
+    cleaned = cleaned.translate(ARABIC_CHAR_TRANSLATION)
+    cleaned = re.sub(r"[^\u0600-\u06FFA-Za-z0-9\s]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def normalize_arabic_output_punctuation(punct: str) -> str:
+    if not punct:
+        return ""
+    return punct.replace("؟", "?").replace("،", ",")
+
+
+def get_arabic_dialect_pivot_for_line(line: str) -> Optional[str]:
+    if not ARABIC_LETTER_RE.search(line):
+        return None
+
+    match = ARABIC_LINE_RE.match(line)
+    if not match:
+        return None
+
+    prefix = match.group("prefix") or ""
+    body = (match.group("body") or "").strip()
+    punct = normalize_arabic_output_punctuation(match.group("punct") or "")
+
+    if not body:
+        return None
+
+    key = normalize_arabic_for_rule_matching(body)
+    if not key:
+        return None
+
+    pivot = ARABIC_DIALECT_EXACT_PIVOTS.get(key)
+    if pivot is None:
+        for pattern, candidate in ARABIC_DIALECT_REGEX_PIVOTS:
+            if pattern.fullmatch(key):
+                pivot = candidate
+                break
+
+    if pivot is None:
+        return None
+
+    # Do not double punctuation if the pivot already ends with punctuation.
+    if punct and pivot[-1:] in ".!?":
+        return f"{prefix}{pivot}"
+    return f"{prefix}{pivot}{punct}"
 
 
 # LibreTranslate can mistranslate very short chat phrases, especially into Korean.
@@ -426,6 +627,8 @@ class RelayBot(commands.Bot):
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.webhook_cache: dict[int, discord.Webhook] = {}
         self.app_emoji_lock = asyncio.Lock()
+        self.arabic_ai_lock = asyncio.Lock()
+        self.arabic_ai_pivot_cache: dict[str, str] = {}
 
     async def setup_hook(self) -> None:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -435,6 +638,9 @@ class RelayBot(commands.Bot):
 
         timeout = aiohttp.ClientTimeout(total=30)
         self.http_session = aiohttp.ClientSession(timeout=timeout)
+
+        if ENABLE_ARABIC_AI_TRANSLATION and ARABIC_AI_WARMUP_ON_START:
+            asyncio.create_task(self.warmup_arabic_ai_model())
 
         synced = await self.tree.sync()
         log.info(
@@ -940,6 +1146,214 @@ class RelayBot(commands.Bot):
         parts.append(text[last_index:])
         return "".join(parts)
 
+    async def warmup_arabic_ai_model(self) -> None:
+        """Preload the local Ollama model so the first Arabic message is faster."""
+        # Wait a little so the bot finishes starting and Ollama has time to be reachable.
+        await asyncio.sleep(2)
+
+        if not ENABLE_ARABIC_AI_TRANSLATION:
+            return
+
+        assert self.http_session is not None
+
+        payload = {
+            "model": ARABIC_AI_MODEL,
+            "stream": False,
+            "keep_alive": ARABIC_AI_KEEP_ALIVE,
+            "prompt": "",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=min(max(ARABIC_AI_TIMEOUT, 10.0), 60.0))
+
+        try:
+            async with self.http_session.post(ARABIC_AI_URL, json=payload, timeout=timeout) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"Ollama warmup error {response.status}: {body}")
+            log.info("Arabic AI model warmup requested for %s with keep_alive=%s.", ARABIC_AI_MODEL, ARABIC_AI_KEEP_ALIVE)
+        except Exception as exc:
+            log.warning("Arabic AI model warmup failed. The bot will still fallback normally. Error: %s", exc)
+
+    def clean_arabic_ai_response(self, response_text: str) -> str:
+        cleaned = response_text.strip()
+
+        # Some local models occasionally add labels or code fences even when told
+        # not to. Strip common wrappers so the bot forwards only the translation.
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        label_patterns = (
+            r"^translation\s*:\s*",
+            r"^english\s*translation\s*:\s*",
+            r"^translated\s*text\s*:\s*",
+        )
+        for pattern in label_patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+
+        return cleaned.strip()
+
+    async def get_arabic_ai_english_pivot(self, text: str) -> Optional[str]:
+        """Use local Ollama/Aya to translate Arabic dialect text to English.
+
+        The English pivot is cached per exact message text so one Arabic message
+        relayed to many target channels calls Ollama only once.
+        """
+        cleaned_text = text.strip()
+        if not ENABLE_ARABIC_AI_TRANSLATION:
+            return None
+
+        if not cleaned_text or not ARABIC_LETTER_RE.search(cleaned_text):
+            return None
+
+        if len(cleaned_text) > ARABIC_AI_MAX_CHARS:
+            log.info(
+                "Arabic AI helper skipped message because it is too long (%s > %s chars).",
+                len(cleaned_text),
+                ARABIC_AI_MAX_CHARS,
+            )
+            return None
+
+        cached = self.arabic_ai_pivot_cache.get(cleaned_text)
+        if cached:
+            return cached
+
+        async with self.arabic_ai_lock:
+            cached = self.arabic_ai_pivot_cache.get(cleaned_text)
+            if cached:
+                return cached
+
+            assert self.http_session is not None
+
+            prompt = (
+                "You are a professional Arabic dialect translator for Discord chat. "
+                "Translate the Arabic message into natural English. Understand Egyptian Arabic, "
+                "Gulf Arabic, UAE Arabic, Levantine Arabic, and casual slang. Preserve line breaks. "
+                "Preserve names, mentions, links, numbers, and emoji text. Return only the English "
+                "translation with no explanation.\n\n"
+                f"{cleaned_text}"
+            )
+
+            payload = {
+                "model": ARABIC_AI_MODEL,
+                "stream": False,
+                "keep_alive": ARABIC_AI_KEEP_ALIVE,
+                "options": {
+                    "temperature": 0,
+                    "num_predict": ARABIC_AI_NUM_PREDICT,
+                },
+                "prompt": prompt,
+            }
+
+            timeout = aiohttp.ClientTimeout(total=ARABIC_AI_TIMEOUT)
+
+            try:
+                async with self.http_session.post(ARABIC_AI_URL, json=payload, timeout=timeout) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        raise RuntimeError(f"Ollama Arabic AI error {response.status}: {body}")
+
+                    data = await response.json()
+                    response_text = data.get("response")
+                    if not response_text:
+                        raise RuntimeError(f"Unexpected Ollama Arabic AI response: {data}")
+
+                    english_pivot = self.clean_arabic_ai_response(str(response_text))
+                    if not english_pivot:
+                        raise RuntimeError("Ollama Arabic AI returned an empty translation.")
+
+                    # Very small cache to avoid repeated Ollama calls when one
+                    # source message is being relayed to many channels.
+                    if len(self.arabic_ai_pivot_cache) > 256:
+                        self.arabic_ai_pivot_cache.clear()
+                    self.arabic_ai_pivot_cache[cleaned_text] = english_pivot
+
+                    log.info("Arabic AI helper translated Arabic message to English pivot.")
+                    return english_pivot
+            except Exception as exc:
+                log.warning("Arabic AI helper failed; falling back to LibreTranslate/rules. Error: %s", exc)
+                return None
+
+    async def translate_arabic_with_ai_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
+        if canonical_language_code(source_norm).split("-", 1)[0] != "ar":
+            return None
+
+        if not ARABIC_LETTER_RE.search(text):
+            return None
+
+        # Arabic -> Arabic does not need AI translation.
+        if canonical_language_code(target_norm).split("-", 1)[0] == "ar":
+            return None
+
+        english_pivot = await self.get_arabic_ai_english_pivot(text)
+        if not english_pivot:
+            return None
+
+        if canonical_language_code(target_norm).split("-", 1)[0] == "en":
+            return english_pivot
+
+        return await self.translate_text(english_pivot, "en", target_norm)
+
+    async def translate_arabic_dialect_text_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
+        """Translate known Arabic/Egyptian dialect phrases through an English pivot.
+
+        This avoids bad literal translations for common dialect lines like
+        "ازيك يا شباب" or "عاملين ايه يا جماعة" while keeping normal Arabic
+        text on the regular LibreTranslate path.
+        """
+        if canonical_language_code(source_norm).split("-", 1)[0] != "ar":
+            return None
+
+        if not ARABIC_LETTER_RE.search(text):
+            return None
+
+        parts = text.splitlines(keepends=True)
+        if not parts:
+            return None
+
+        # Only take the dialect override path when every non-empty line matches
+        # a known dialect rule. If any line is normal Arabic, return None and let
+        # the regular LibreTranslate Arabic path handle the whole text. This also
+        # avoids recursive calls back into translate_text for unmatched lines.
+        pivot_parts: list[tuple[str, str]] = []
+        blank_parts: dict[int, str] = {}
+
+        for index, part in enumerate(parts):
+            line = part.rstrip("\r\n")
+            newline = part[len(line):]
+
+            if not line.strip():
+                blank_parts[index] = part
+                continue
+
+            pivot = get_arabic_dialect_pivot_for_line(line)
+            if pivot is None:
+                return None
+
+            pivot_parts.append((pivot, newline))
+
+        if not pivot_parts:
+            return None
+
+        translated_parts: list[str] = []
+        pivot_index = 0
+
+        for index, part in enumerate(parts):
+            if index in blank_parts:
+                translated_parts.append(blank_parts[index])
+                continue
+
+            pivot, newline = pivot_parts[pivot_index]
+            pivot_index += 1
+
+            if canonical_language_code(target_norm).split("-", 1)[0] == "en":
+                translated_parts.append(pivot)
+            else:
+                translated_parts.append(await self.translate_text(pivot, "en", target_norm))
+            translated_parts.append(newline)
+
+        return "".join(translated_parts)
+
     async def delete_relay_records_for_source(self, guild_id: int, source_channel_id: int, source_message_id: int) -> None:
         assert self.db is not None
         await self.db.execute(
@@ -968,6 +1382,14 @@ class RelayBot(commands.Bot):
 
         source_norm = canonical_language_code(source_lang)
         target_norm = canonical_language_code(target_lang)
+
+        # If someone writes Arabic text in the "wrong" linked channel, do not
+        # force LibreTranslate to treat that Arabic as the channel language
+        # (for example, Arabic text in an English channel). That can produce
+        # random/garbled output. Treat Arabic-script text as Arabic instead.
+        if ARABIC_LETTER_RE.search(text) and source_norm.split("-", 1)[0] != "ar":
+            source_norm = "ar"
+            source_lang = "ar"
 
         if source_norm == target_norm:
             return text
@@ -1003,6 +1425,14 @@ class RelayBot(commands.Bot):
                     translated_parts.append(after)
 
             return "".join(translated_parts)
+
+        arabic_ai_translation = await self.translate_arabic_with_ai_if_needed(text, source_norm, target_norm)
+        if arabic_ai_translation is not None:
+            return arabic_ai_translation
+
+        arabic_dialect_translation = await self.translate_arabic_dialect_text_if_needed(text, source_norm, target_norm)
+        if arabic_dialect_translation is not None:
+            return arabic_dialect_translation
 
         text = normalize_chat_slang_for_translation(text, source_norm)
 
