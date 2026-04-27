@@ -75,6 +75,8 @@ ARABIC_AI_MODEL = os.getenv("ARABIC_AI_MODEL", "aya-expanse:8b")
 ARABIC_AI_TIMEOUT = max(10.0, float(os.getenv("ARABIC_AI_TIMEOUT", "45")))
 ARABIC_AI_MAX_CHARS = max(100, int(os.getenv("ARABIC_AI_MAX_CHARS", "800")))
 ARABIC_AI_NUM_PREDICT = max(80, int(os.getenv("ARABIC_AI_NUM_PREDICT", "260")))
+ARABIC_AI_KEEP_ALIVE = os.getenv("ARABIC_AI_KEEP_ALIVE", "30m")
+ARABIC_AI_WARMUP_ON_START = os.getenv("ARABIC_AI_WARMUP_ON_START", "true").lower() in {"1", "true", "yes", "on"}
 
 
 def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
@@ -630,6 +632,9 @@ class RelayBot(commands.Bot):
         timeout = aiohttp.ClientTimeout(total=30)
         self.http_session = aiohttp.ClientSession(timeout=timeout)
 
+        if ENABLE_ARABIC_AI_TRANSLATION and ARABIC_AI_WARMUP_ON_START:
+            asyncio.create_task(self.warmup_arabic_ai_model())
+
         synced = await self.tree.sync()
         log.info(
             "Synced %s global command(s). Multi-server mode is enabled; "
@@ -1134,6 +1139,34 @@ class RelayBot(commands.Bot):
         parts.append(text[last_index:])
         return "".join(parts)
 
+    async def warmup_arabic_ai_model(self) -> None:
+        """Preload the local Ollama model so the first Arabic message is faster."""
+        # Wait a little so the bot finishes starting and Ollama has time to be reachable.
+        await asyncio.sleep(2)
+
+        if not ENABLE_ARABIC_AI_TRANSLATION:
+            return
+
+        assert self.http_session is not None
+
+        payload = {
+            "model": ARABIC_AI_MODEL,
+            "stream": False,
+            "keep_alive": ARABIC_AI_KEEP_ALIVE,
+            "prompt": "",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=min(max(ARABIC_AI_TIMEOUT, 10.0), 60.0))
+
+        try:
+            async with self.http_session.post(ARABIC_AI_URL, json=payload, timeout=timeout) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"Ollama warmup error {response.status}: {body}")
+            log.info("Arabic AI model warmup requested for %s with keep_alive=%s.", ARABIC_AI_MODEL, ARABIC_AI_KEEP_ALIVE)
+        except Exception as exc:
+            log.warning("Arabic AI model warmup failed. The bot will still fallback normally. Error: %s", exc)
+
     def clean_arabic_ai_response(self, response_text: str) -> str:
         cleaned = response_text.strip()
 
@@ -1197,6 +1230,7 @@ class RelayBot(commands.Bot):
             payload = {
                 "model": ARABIC_AI_MODEL,
                 "stream": False,
+                "keep_alive": ARABIC_AI_KEEP_ALIVE,
                 "options": {
                     "temperature": 0,
                     "num_predict": ARABIC_AI_NUM_PREDICT,
