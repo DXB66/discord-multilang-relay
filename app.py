@@ -66,6 +66,16 @@ CUSTOM_EMOJI_RE = re.compile(r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_]{2,32}):(?
 ENABLE_APP_EMOJI_CACHE = os.getenv("ENABLE_APP_EMOJI_CACHE", "true").lower() in {"1", "true", "yes", "on"}
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
+# Optional local AI helper for Arabic dialect translation.
+# This is self-hosted through Ollama, so it has no paid API/character quota.
+# Keep it disabled until the ollama container is reachable from the bot container.
+ENABLE_ARABIC_AI_TRANSLATION = os.getenv("ENABLE_ARABIC_AI_TRANSLATION", "false").lower() in {"1", "true", "yes", "on"}
+ARABIC_AI_URL = os.getenv("ARABIC_AI_URL", "http://ollama:11434/api/generate")
+ARABIC_AI_MODEL = os.getenv("ARABIC_AI_MODEL", "aya-expanse:8b")
+ARABIC_AI_TIMEOUT = max(10.0, float(os.getenv("ARABIC_AI_TIMEOUT", "45")))
+ARABIC_AI_MAX_CHARS = max(100, int(os.getenv("ARABIC_AI_MAX_CHARS", "800")))
+ARABIC_AI_NUM_PREDICT = max(80, int(os.getenv("ARABIC_AI_NUM_PREDICT", "260")))
+
 
 def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_]+", "_", original_name).strip("_") or "emoji"
@@ -608,6 +618,8 @@ class RelayBot(commands.Bot):
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.webhook_cache: dict[int, discord.Webhook] = {}
         self.app_emoji_lock = asyncio.Lock()
+        self.arabic_ai_lock = asyncio.Lock()
+        self.arabic_ai_pivot_cache: dict[str, str] = {}
 
     async def setup_hook(self) -> None:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -1122,6 +1134,125 @@ class RelayBot(commands.Bot):
         parts.append(text[last_index:])
         return "".join(parts)
 
+    def clean_arabic_ai_response(self, response_text: str) -> str:
+        cleaned = response_text.strip()
+
+        # Some local models occasionally add labels or code fences even when told
+        # not to. Strip common wrappers so the bot forwards only the translation.
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        label_patterns = (
+            r"^translation\s*:\s*",
+            r"^english\s*translation\s*:\s*",
+            r"^translated\s*text\s*:\s*",
+        )
+        for pattern in label_patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+
+        return cleaned.strip()
+
+    async def get_arabic_ai_english_pivot(self, text: str) -> Optional[str]:
+        """Use local Ollama/Aya to translate Arabic dialect text to English.
+
+        The English pivot is cached per exact message text so one Arabic message
+        relayed to many target channels calls Ollama only once.
+        """
+        cleaned_text = text.strip()
+        if not ENABLE_ARABIC_AI_TRANSLATION:
+            return None
+
+        if not cleaned_text or not ARABIC_LETTER_RE.search(cleaned_text):
+            return None
+
+        if len(cleaned_text) > ARABIC_AI_MAX_CHARS:
+            log.info(
+                "Arabic AI helper skipped message because it is too long (%s > %s chars).",
+                len(cleaned_text),
+                ARABIC_AI_MAX_CHARS,
+            )
+            return None
+
+        cached = self.arabic_ai_pivot_cache.get(cleaned_text)
+        if cached:
+            return cached
+
+        async with self.arabic_ai_lock:
+            cached = self.arabic_ai_pivot_cache.get(cleaned_text)
+            if cached:
+                return cached
+
+            assert self.http_session is not None
+
+            prompt = (
+                "You are a professional Arabic dialect translator for Discord chat. "
+                "Translate the Arabic message into natural English. Understand Egyptian Arabic, "
+                "Gulf Arabic, UAE Arabic, Levantine Arabic, and casual slang. Preserve line breaks. "
+                "Preserve names, mentions, links, numbers, and emoji text. Return only the English "
+                "translation with no explanation.\n\n"
+                f"{cleaned_text}"
+            )
+
+            payload = {
+                "model": ARABIC_AI_MODEL,
+                "stream": False,
+                "options": {
+                    "temperature": 0,
+                    "num_predict": ARABIC_AI_NUM_PREDICT,
+                },
+                "prompt": prompt,
+            }
+
+            timeout = aiohttp.ClientTimeout(total=ARABIC_AI_TIMEOUT)
+
+            try:
+                async with self.http_session.post(ARABIC_AI_URL, json=payload, timeout=timeout) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        raise RuntimeError(f"Ollama Arabic AI error {response.status}: {body}")
+
+                    data = await response.json()
+                    response_text = data.get("response")
+                    if not response_text:
+                        raise RuntimeError(f"Unexpected Ollama Arabic AI response: {data}")
+
+                    english_pivot = self.clean_arabic_ai_response(str(response_text))
+                    if not english_pivot:
+                        raise RuntimeError("Ollama Arabic AI returned an empty translation.")
+
+                    # Very small cache to avoid repeated Ollama calls when one
+                    # source message is being relayed to many channels.
+                    if len(self.arabic_ai_pivot_cache) > 256:
+                        self.arabic_ai_pivot_cache.clear()
+                    self.arabic_ai_pivot_cache[cleaned_text] = english_pivot
+
+                    log.info("Arabic AI helper translated Arabic message to English pivot.")
+                    return english_pivot
+            except Exception as exc:
+                log.warning("Arabic AI helper failed; falling back to LibreTranslate/rules. Error: %s", exc)
+                return None
+
+    async def translate_arabic_with_ai_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
+        if canonical_language_code(source_norm).split("-", 1)[0] != "ar":
+            return None
+
+        if not ARABIC_LETTER_RE.search(text):
+            return None
+
+        # Arabic -> Arabic does not need AI translation.
+        if canonical_language_code(target_norm).split("-", 1)[0] == "ar":
+            return None
+
+        english_pivot = await self.get_arabic_ai_english_pivot(text)
+        if not english_pivot:
+            return None
+
+        if canonical_language_code(target_norm).split("-", 1)[0] == "en":
+            return english_pivot
+
+        return await self.translate_text(english_pivot, "en", target_norm)
+
     async def translate_arabic_dialect_text_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
         """Translate known Arabic/Egyptian dialect phrases through an English pivot.
 
@@ -1253,6 +1384,10 @@ class RelayBot(commands.Bot):
                     translated_parts.append(after)
 
             return "".join(translated_parts)
+
+        arabic_ai_translation = await self.translate_arabic_with_ai_if_needed(text, source_norm, target_norm)
+        if arabic_ai_translation is not None:
+            return arabic_ai_translation
 
         arabic_dialect_translation = await self.translate_arabic_dialect_text_if_needed(text, source_norm, target_norm)
         if arabic_dialect_translation is not None:
