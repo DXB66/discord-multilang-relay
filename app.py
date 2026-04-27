@@ -477,6 +477,28 @@ def build_no_drop_fallback_content(source_lang: str, original_text: str, attachm
     return "\n\n".join(part for part in parts if part).strip()
 
 
+def get_message_sticker_links(message: discord.Message) -> list[str]:
+    """Return CDN URLs for stickers attached to a Discord message.
+
+    Webhooks cannot resend a Discord sticker as a real sticker, so the safest
+    mirror is the sticker CDN URL. Discord will usually render static/APNG/GIF
+    sticker URLs as an image/GIF preview in the target channels.
+    """
+    links: list[str] = []
+
+    for sticker in getattr(message, "stickers", []) or []:
+        url = getattr(sticker, "url", None)
+        if url:
+            links.append(str(url))
+            continue
+
+        sticker_id = getattr(sticker, "id", None)
+        if sticker_id is not None:
+            links.append(f"https://media.discordapp.net/stickers/{sticker_id}.png?size=160")
+
+    return links
+
+
 def split_text_for_limit(text: str, limit: int) -> list[str]:
     cleaned = text.strip()
     if not cleaned:
@@ -2070,6 +2092,9 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
     source_lang = row["language_code"]
     original_text = message.content or ""
     attachment_links = [a.url for a in message.attachments]
+    sticker_links = get_message_sticker_links(message)
+    if sticker_links:
+        attachment_links.extend(sticker_links)
     display_name = message.author.display_name
     avatar_url = message.author.display_avatar.url
 
@@ -2326,7 +2351,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
     if payload.guild_id is None:
         return
 
-    if "content" not in payload.data and "attachments" not in payload.data:
+    if "content" not in payload.data and "attachments" not in payload.data and "stickers" not in payload.data:
         return
 
     channel = await resolve_text_channel(payload.channel_id)
@@ -2352,7 +2377,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
     existing_rows = await bot.get_relay_records_for_source(payload.guild_id, payload.channel_id, payload.message_id)
     existing_records_by_target = group_relay_rows_by_target(existing_rows)
 
-    if not message.content and not message.attachments:
+    if not message.content and not message.attachments and not getattr(message, "stickers", None):
         await delete_mirrored_messages(payload.guild_id, payload.channel_id, payload.message_id)
         return
 
@@ -2370,7 +2395,7 @@ async def on_message(message: discord.Message) -> None:
     if message.webhook_id is not None:
         return
 
-    if not message.content and not message.attachments:
+    if not message.content and not message.attachments and not getattr(message, "stickers", None):
         return
 
     await sync_linked_message(message)
