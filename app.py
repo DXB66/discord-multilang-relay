@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import logging
 import os
 import re
@@ -110,6 +111,9 @@ FULL_AI_MAX_CHARS = max(100, int(os.getenv("FULL_AI_MAX_CHARS", "800")))
 FULL_AI_NUM_PREDICT = max(80, int(os.getenv("FULL_AI_NUM_PREDICT", "260")))
 FULL_AI_KEEP_ALIVE = os.getenv("FULL_AI_KEEP_ALIVE", ARABIC_AI_KEEP_ALIVE)
 FULL_AI_WARMUP_ON_START = os.getenv("FULL_AI_WARMUP_ON_START", "true").lower() in {"1", "true", "yes", "on"}
+FULL_AI_BATCH_TRANSLATION = os.getenv("FULL_AI_BATCH_TRANSLATION", "true").lower() in {"1", "true", "yes", "on"}
+FULL_AI_BATCH_MAX_TARGETS = max(1, int(os.getenv("FULL_AI_BATCH_MAX_TARGETS", "12")))
+FULL_AI_BATCH_NUM_PREDICT = max(200, int(os.getenv("FULL_AI_BATCH_NUM_PREDICT", "900")))
 
 
 def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
@@ -269,6 +273,255 @@ def language_display_name(code: str) -> str:
 
     # Last-resort label for custom language codes.
     return normalized.upper()
+
+
+def normalize_ai_cache_text(text: str) -> str:
+    """Make tiny/simple repeated chat messages reuse the same AI cache entry.
+
+    This makes "Hello", "hello", "HELLO", and " hello " share a cached
+    translation, while avoiding aggressive lowercasing for longer messages where
+    casing can carry meaning.
+    """
+    cleaned = " ".join(text.strip().split())
+    if not cleaned:
+        return cleaned
+
+    if "\n" not in cleaned and len(cleaned) <= 80 and not DISCORD_PROTECTED_TOKEN_RE.search(cleaned):
+        return cleaned.lower()
+
+    return cleaned
+
+
+COMMON_PHRASE_RE = re.compile(r"^(?P<prefix>\s*)(?P<body>[A-Za-z' ]+?)(?P<punct>[.!?。！？…]*)\s*$", re.DOTALL)
+
+COMMON_PHRASE_TRANSLATIONS: dict[str, dict[str, str]] = {
+    "hello": {
+        "ar": "مرحبًا",
+        "es": "Hola",
+        "pt": "Olá",
+        "ru": "Привет",
+        "pl": "Cześć",
+        "tr": "Merhaba",
+        "ko": "안녕하세요",
+        "zh": "你好",
+        "zh-hans": "你好",
+        "zt": "你好",
+        "zh-hant": "你好",
+    },
+    "hi": {
+        "ar": "مرحبًا",
+        "es": "Hola",
+        "pt": "Olá",
+        "ru": "Привет",
+        "pl": "Cześć",
+        "tr": "Merhaba",
+        "ko": "안녕하세요",
+        "zh": "你好",
+        "zh-hans": "你好",
+        "zt": "你好",
+        "zh-hant": "你好",
+    },
+    "hey": {
+        "ar": "مرحبًا",
+        "es": "Hola",
+        "pt": "Olá",
+        "ru": "Привет",
+        "pl": "Cześć",
+        "tr": "Merhaba",
+        "ko": "안녕하세요",
+        "zh": "嘿",
+        "zh-hans": "嘿",
+        "zt": "嘿",
+        "zh-hant": "嘿",
+    },
+    "bye": {
+        "ar": "وداعًا",
+        "es": "Adiós",
+        "pt": "Tchau",
+        "ru": "Пока",
+        "pl": "Cześć",
+        "tr": "Görüşürüz",
+        "ko": "안녕히 가세요",
+        "zh": "再见",
+        "zh-hans": "再见",
+        "zt": "再見",
+        "zh-hant": "再見",
+    },
+    "goodbye": {
+        "ar": "وداعًا",
+        "es": "Adiós",
+        "pt": "Adeus",
+        "ru": "До свидания",
+        "pl": "Do widzenia",
+        "tr": "Hoşça kal",
+        "ko": "안녕히 가세요",
+        "zh": "再见",
+        "zh-hans": "再见",
+        "zt": "再見",
+        "zh-hant": "再見",
+    },
+    "thanks": {
+        "ar": "شكرًا",
+        "es": "Gracias",
+        "pt": "Obrigado",
+        "ru": "Спасибо",
+        "pl": "Dzięki",
+        "tr": "Teşekkürler",
+        "ko": "감사합니다",
+        "zh": "谢谢",
+        "zh-hans": "谢谢",
+        "zt": "謝謝",
+        "zh-hant": "謝謝",
+    },
+    "thank you": {
+        "ar": "شكرًا",
+        "es": "Gracias",
+        "pt": "Obrigado",
+        "ru": "Спасибо",
+        "pl": "Dziękuję",
+        "tr": "Teşekkür ederim",
+        "ko": "감사합니다",
+        "zh": "谢谢",
+        "zh-hans": "谢谢",
+        "zt": "謝謝",
+        "zh-hant": "謝謝",
+    },
+    "yes": {
+        "ar": "نعم",
+        "es": "Sí",
+        "pt": "Sim",
+        "ru": "Да",
+        "pl": "Tak",
+        "tr": "Evet",
+        "ko": "네",
+        "zh": "是的",
+        "zh-hans": "是的",
+        "zt": "是的",
+        "zh-hant": "是的",
+    },
+    "no": {
+        "ar": "لا",
+        "es": "No",
+        "pt": "Não",
+        "ru": "Нет",
+        "pl": "Nie",
+        "tr": "Hayır",
+        "ko": "아니요",
+        "zh": "不",
+        "zh-hans": "不",
+        "zt": "不",
+        "zh-hant": "不",
+    },
+    "ok": {
+        "ar": "حسنًا",
+        "es": "Está bien",
+        "pt": "Tudo bem",
+        "ru": "Хорошо",
+        "pl": "Okej",
+        "tr": "Tamam",
+        "ko": "알겠습니다",
+        "zh": "好的",
+        "zh-hans": "好的",
+        "zt": "好的",
+        "zh-hant": "好的",
+    },
+    "okay": {
+        "ar": "حسنًا",
+        "es": "Está bien",
+        "pt": "Tudo bem",
+        "ru": "Хорошо",
+        "pl": "Okej",
+        "tr": "Tamam",
+        "ko": "알겠습니다",
+        "zh": "好的",
+        "zh-hans": "好的",
+        "zt": "好的",
+        "zh-hant": "好的",
+    },
+    "lol": {
+        "ar": "هههه",
+        "es": "jajaja",
+        "pt": "kkkk",
+        "ru": "хаха",
+        "pl": "haha",
+        "tr": "haha",
+        "ko": "ㅋㅋ",
+        "zh": "哈哈",
+        "zh-hans": "哈哈",
+        "zt": "哈哈",
+        "zh-hant": "哈哈",
+    },
+    "good morning": {
+        "ar": "صباح الخير",
+        "es": "Buenos días",
+        "pt": "Bom dia",
+        "ru": "Доброе утро",
+        "pl": "Dzień dobry",
+        "tr": "Günaydın",
+        "ko": "좋은 아침입니다",
+        "zh": "早上好",
+        "zh-hans": "早上好",
+        "zt": "早安",
+        "zh-hant": "早安",
+    },
+    "good night": {
+        "ar": "تصبح على خير",
+        "es": "Buenas noches",
+        "pt": "Boa noite",
+        "ru": "Спокойной ночи",
+        "pl": "Dobranoc",
+        "tr": "İyi geceler",
+        "ko": "좋은 밤 되세요",
+        "zh": "晚安",
+        "zh-hans": "晚安",
+        "zt": "晚安",
+        "zh-hant": "晚安",
+    },
+}
+
+
+def common_phrase_target_key(target_lang: str) -> str:
+    normalized = canonical_language_code(target_lang)
+    if normalized in TRADITIONAL_CHINESE_CODES:
+        return "zh-hant"
+    if normalized in SIMPLIFIED_CHINESE_CODES:
+        return "zh"
+    return normalized.split("-", 1)[0]
+
+
+def get_common_phrase_translation(text: str, source_lang: str, target_lang: str) -> Optional[str]:
+    """Instant translations for very common short English chat messages.
+
+    This keeps full-AI mode fast for repeated/basic Discord messages without
+    reducing quality for longer or more nuanced messages.
+    """
+    source_base = canonical_language_code(source_lang).split("-", 1)[0]
+    target_norm = canonical_language_code(target_lang)
+    target_base = target_norm.split("-", 1)[0]
+
+    if source_base != "en" or target_base == "en":
+        return None
+
+    if "\n" in text or len(text.strip()) > 40:
+        return None
+
+    match = COMMON_PHRASE_RE.match(text)
+    if not match:
+        return None
+
+    phrase = " ".join((match.group("body") or "").strip().lower().split())
+    translations = COMMON_PHRASE_TRANSLATIONS.get(phrase)
+    if not translations:
+        return None
+
+    target_key = common_phrase_target_key(target_norm)
+    translated = translations.get(target_key)
+    if translated is None:
+        return None
+
+    prefix = match.group("prefix") or ""
+    punct = match.group("punct") or ""
+    return normalize_translated_output_for_target(f"{prefix}{translated}{punct}", target_norm)
 
 
 # LibreTranslate/Argos can be weak with Arabic dialects such as Egyptian Arabic.
@@ -741,6 +994,7 @@ class RelayBot(commands.Bot):
         self.korean_ai_cache: dict[tuple[str, str, str], str] = {}
         self.full_ai_lock = asyncio.Lock()
         self.full_ai_cache: dict[tuple[str, str, str], str] = {}
+        self.full_ai_batch_cache: dict[tuple[str, tuple[str, ...], str], dict[str, str]] = {}
 
     async def setup_hook(self) -> None:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -1623,6 +1877,10 @@ class RelayBot(commands.Bot):
         if source_norm == target_norm:
             return text
 
+        common_translation = get_common_phrase_translation(cleaned_text, source_norm, target_norm)
+        if common_translation is not None:
+            return common_translation
+
         if len(cleaned_text) > FULL_AI_MAX_CHARS:
             log.info(
                 "Full AI translator skipped message because it is too long (%s > %s chars).",
@@ -1631,7 +1889,8 @@ class RelayBot(commands.Bot):
             )
             return None
 
-        cache_key = (source_norm, target_norm, cleaned_text)
+        cache_text = normalize_ai_cache_text(cleaned_text)
+        cache_key = (source_norm, target_norm, cache_text)
         cached = self.full_ai_cache.get(cache_key)
         if cached:
             return cached
@@ -1693,6 +1952,197 @@ class RelayBot(commands.Bot):
             except Exception as exc:
                 log.warning("Full AI translator failed; falling back to hybrid/LibreTranslate. Error: %s", exc)
                 return None
+
+    def parse_full_ai_batch_response(self, response_text: str, requested_targets: list[str]) -> dict[str, str]:
+        """Parse a JSON-first batch translation response from the local AI model."""
+        cleaned = self.clean_arabic_ai_response(response_text)
+        requested = {canonical_language_code(code) for code in requested_targets}
+        parsed: dict[str, str] = {}
+
+        # Preferred format: {"ar": "...", "es": "..."}
+        try:
+            json_text = cleaned
+            if "{" in cleaned and "}" in cleaned:
+                json_text = cleaned[cleaned.find("{"): cleaned.rfind("}") + 1]
+            data = json.loads(json_text)
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    norm_key = canonical_language_code(str(key))
+                    if norm_key in requested and isinstance(value, str) and value.strip():
+                        parsed[norm_key] = value.strip()
+        except Exception:
+            parsed = {}
+
+        if parsed:
+            return parsed
+
+        # Fallback format: ar: translation
+        for raw_line in cleaned.splitlines():
+            line = raw_line.strip()
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            norm_key = canonical_language_code(key.strip().strip('"').strip("'"))
+            if norm_key in requested and value.strip():
+                parsed[norm_key] = value.strip().strip('"').strip("'")
+
+        return parsed
+
+    async def get_full_ai_batch_translations(
+        self,
+        text: str,
+        source_norm: str,
+        target_norms: list[str],
+    ) -> dict[str, str]:
+        """Translate one source message into many target languages with one AI call.
+
+        This is the main speed improvement for TRANSLATION_ENGINE=ai. Instead of
+        making one Ollama request per linked channel, the bot asks Aya for all
+        target languages at once and caches the individual results.
+        """
+        cleaned_text = text.strip()
+        if not ENABLE_FULL_AI_TRANSLATION or not FULL_AI_BATCH_TRANSLATION:
+            return {}
+
+        if not cleaned_text:
+            return {}
+
+        if DISCORD_PROTECTED_TOKEN_RE.search(cleaned_text):
+            # Let translate_text handle protected-token splitting safely.
+            return {}
+
+        if len(cleaned_text) > FULL_AI_MAX_CHARS:
+            return {}
+
+        source_norm = canonical_language_code(source_norm)
+        unique_targets: list[str] = []
+        seen_targets: set[str] = set()
+
+        for target in target_norms:
+            target_norm = canonical_language_code(target)
+            if target_norm == source_norm:
+                continue
+            if target_norm in seen_targets:
+                continue
+            seen_targets.add(target_norm)
+            unique_targets.append(target_norm)
+
+        if not unique_targets or len(unique_targets) > FULL_AI_BATCH_MAX_TARGETS:
+            return {}
+
+        cache_text = normalize_ai_cache_text(cleaned_text)
+        results: dict[str, str] = {}
+
+        for target_norm in unique_targets:
+            common_translation = get_common_phrase_translation(cleaned_text, source_norm, target_norm)
+            if common_translation is not None:
+                results[target_norm] = common_translation
+                self.full_ai_cache[(source_norm, target_norm, cache_text)] = common_translation
+                continue
+
+            cached = self.full_ai_cache.get((source_norm, target_norm, cache_text))
+            if cached:
+                results[target_norm] = cached
+
+        missing_targets = [target for target in unique_targets if target not in results]
+        if not missing_targets:
+            return results
+
+        batch_key = (source_norm, tuple(missing_targets), cache_text)
+        cached_batch = self.full_ai_batch_cache.get(batch_key)
+        if cached_batch:
+            results.update(cached_batch)
+            return results
+
+        async with self.full_ai_lock:
+            cached_batch = self.full_ai_batch_cache.get(batch_key)
+            if cached_batch:
+                results.update(cached_batch)
+                return results
+
+            # Another coroutine may have filled individual cache while waiting.
+            still_missing: list[str] = []
+            for target_norm in missing_targets:
+                cached = self.full_ai_cache.get((source_norm, target_norm, cache_text))
+                if cached:
+                    results[target_norm] = cached
+                else:
+                    still_missing.append(target_norm)
+
+            if not still_missing:
+                return results
+
+            assert self.http_session is not None
+
+            source_name = language_display_name(source_norm)
+            target_descriptions = {
+                target: language_display_name(target)
+                for target in still_missing
+            }
+            target_json = json.dumps(target_descriptions, ensure_ascii=False)
+
+            prompt = (
+                "You are a professional Discord chat translator. "
+                f"Translate the message from {source_name} into every target language listed in this JSON object: {target_json}. "
+                "Return ONLY a compact JSON object. The JSON keys must be exactly the same target language codes. "
+                "The JSON values must be only the translated messages. "
+                "Use natural language suitable for Discord chat while preserving exact meaning, tone, and slang. "
+                "Preserve line breaks, names, mentions, role/channel mentions, links, numbers, emoji text, and custom emoji tokens. "
+                "Do not add explanations, markdown, quotes outside JSON, or extra commentary.\n\n"
+                f"Message:\n{cleaned_text}"
+            )
+
+            payload = {
+                "model": FULL_AI_MODEL,
+                "stream": False,
+                "keep_alive": FULL_AI_KEEP_ALIVE,
+                "options": {
+                    "temperature": 0,
+                    "num_predict": FULL_AI_BATCH_NUM_PREDICT,
+                },
+                "prompt": prompt,
+            }
+
+            timeout = aiohttp.ClientTimeout(total=FULL_AI_TIMEOUT)
+
+            try:
+                async with self.http_session.post(FULL_AI_URL, json=payload, timeout=timeout) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        raise RuntimeError(f"Ollama full AI batch error {response.status}: {body}")
+
+                    data = await response.json()
+                    response_text = data.get("response")
+                    if not response_text:
+                        raise RuntimeError(f"Unexpected Ollama full AI batch response: {data}")
+
+                    parsed = self.parse_full_ai_batch_response(str(response_text), still_missing)
+                    if not parsed:
+                        raise RuntimeError(f"Could not parse full AI batch response: {response_text}")
+
+                    batch_results: dict[str, str] = {}
+                    for target_norm, translated in parsed.items():
+                        translated = normalize_translated_output_for_target(translated, target_norm)
+                        batch_results[target_norm] = translated
+                        self.full_ai_cache[(source_norm, target_norm, cache_text)] = translated
+
+                    if len(self.full_ai_cache) > 1024:
+                        self.full_ai_cache.clear()
+                    if len(self.full_ai_batch_cache) > 128:
+                        self.full_ai_batch_cache.clear()
+
+                    self.full_ai_batch_cache[batch_key] = batch_results
+                    results.update(batch_results)
+
+                    log.info(
+                        "Full AI batch translator handled %s -> %s target language(s).",
+                        source_norm,
+                        len(batch_results),
+                    )
+                    return results
+            except Exception as exc:
+                log.warning("Full AI batch translator failed; falling back to per-target translation. Error: %s", exc)
+                return results
 
     async def translate_full_ai_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
         if not ENABLE_FULL_AI_TRANSLATION:
@@ -1808,6 +2258,10 @@ class RelayBot(commands.Bot):
 
         if source_norm == target_norm:
             return text
+
+        common_translation = get_common_phrase_translation(text, source_norm, target_norm)
+        if common_translation is not None:
+            return common_translation
 
         short_override = get_short_phrase_override(text, target_norm)
         if short_override is not None:
@@ -2384,6 +2838,7 @@ async def relay_to_target(
     display_name: str,
     avatar_url: str,
     existing_message_ids: Optional[list[int]] = None,
+    pretranslated_text: Optional[str] = None,
 ) -> tuple[int, list[int]] | None:
     if message.guild is None:
         return None
@@ -2399,7 +2854,10 @@ async def relay_to_target(
     used_fallback = False
 
     try:
-        translated_text = await bot.translate_text(original_text, source_lang, target["language_code"])
+        if pretranslated_text is not None:
+            translated_text = pretranslated_text
+        else:
+            translated_text = await bot.translate_text(original_text, source_lang, target["language_code"])
         final_content = translated_text.strip()
     except Exception as exc:
         if not NO_DROP_FALLBACK:
@@ -2539,6 +2997,24 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
         return
 
     existing_records_by_target = existing_records_by_target or {}
+    pretranslated_by_channel: dict[int, str] = {}
+
+    if ENABLE_FULL_AI_TRANSLATION and FULL_AI_BATCH_TRANSLATION and original_text.strip():
+        batch_targets = [
+            canonical_language_code(target["language_code"])
+            for target in relay_targets
+        ]
+        batch_translations = await bot.get_full_ai_batch_translations(
+            original_text,
+            source_lang,
+            batch_targets,
+        )
+        for target in relay_targets:
+            target_norm = canonical_language_code(target["language_code"])
+            translated = batch_translations.get(target_norm)
+            if translated is not None:
+                pretranslated_by_channel[target["channel_id"]] = translated
+
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_RELAYS)
 
     async def run_relay(target: aiosqlite.Row):
@@ -2553,6 +3029,7 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
                 display_name=display_name,
                 avatar_url=avatar_url,
                 existing_message_ids=existing_records_by_target.get(target["channel_id"]),
+                pretranslated_text=pretranslated_by_channel.get(target["channel_id"]),
             )
 
     results = await asyncio.gather(*(run_relay(target) for target in relay_targets), return_exceptions=True)
