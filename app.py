@@ -21,6 +21,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("multilang-relay")
 
+# Optional route logging for translation debugging.
+# This logs which translation path handled the message without logging private message content.
+ENABLE_TRANSLATION_ROUTE_LOGS = os.getenv("ENABLE_TRANSLATION_ROUTE_LOGS", "true").lower() in {"1", "true", "yes", "on"}
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://localhost:5000").rstrip("/")
 # Multi-server mode: commands are registered globally, and each server keeps its
@@ -304,6 +308,33 @@ def language_display_name(code: str) -> str:
 
     # Last-resort label for custom language codes.
     return normalized.upper()
+
+
+
+def log_translation_route(route: str, source_lang: str, target_lang: str, text: str, detail: str = "") -> None:
+    """Log the translation path without exposing message content."""
+    if not ENABLE_TRANSLATION_ROUTE_LOGS:
+        return
+
+    try:
+        source_norm = canonical_language_code(source_lang)
+    except Exception:
+        source_norm = str(source_lang)
+
+    try:
+        target_norm = canonical_language_code(target_lang)
+    except Exception:
+        target_norm = str(target_lang)
+
+    suffix = f" {detail}" if detail else ""
+    log.info(
+        "translation_route route=%s %s->%s chars=%s%s",
+        route,
+        source_norm,
+        target_norm,
+        len(text or ""),
+        suffix,
+    )
 
 
 def normalize_ai_cache_text(text: str) -> str:
@@ -2478,11 +2509,13 @@ class RelayBot(commands.Bot):
             if common_translation is not None:
                 results[target_norm] = common_translation
                 self.full_ai_cache[(source_norm, target_norm, cache_text)] = common_translation
+                log_translation_route("full-ai-batch-common-phrase", source_norm, target_norm, cleaned_text)
                 continue
 
             cached = self.full_ai_cache.get((source_norm, target_norm, cache_text))
             if cached:
                 results[target_norm] = cached
+                log_translation_route("full-ai-batch-memory-cache", source_norm, target_norm, cleaned_text)
 
         missing_targets = [target for target in unique_targets if target not in results]
         if not missing_targets:
@@ -2492,6 +2525,8 @@ class RelayBot(commands.Bot):
         cached_batch = self.full_ai_batch_cache.get(batch_key)
         if cached_batch:
             results.update(cached_batch)
+            for target_norm in cached_batch:
+                log_translation_route("full-ai-batch-cache", source_norm, target_norm, cleaned_text)
             return results
 
         async with self.full_ai_lock:
@@ -2565,6 +2600,7 @@ class RelayBot(commands.Bot):
                         translated = normalize_translated_output_for_target(translated, target_norm)
                         batch_results[target_norm] = translated
                         self.full_ai_cache[(source_norm, target_norm, cache_text)] = translated
+                        log_translation_route("full-ai-batch", source_norm, target_norm, cleaned_text)
 
                     if len(self.full_ai_cache) > 1024:
                         self.full_ai_cache.clear()
@@ -2706,18 +2742,22 @@ class RelayBot(commands.Bot):
             source_lang = "ko"
 
         if source_norm == target_norm:
+            log_translation_route("same-language", source_norm, target_norm, text)
             return text
 
         cached_translation = await self.get_cached_translation(text, source_norm, target_norm)
         if cached_translation is not None:
+            log_translation_route("persistent-cache", source_norm, target_norm, text)
             return normalize_translated_output_for_target(cached_translation, target_norm)
 
         common_translation = get_common_phrase_translation(text, source_norm, target_norm)
         if common_translation is not None:
+            log_translation_route("common-phrase", source_norm, target_norm, text)
             return await self.remember_translation_result(text, source_norm, target_norm, common_translation)
 
         short_override = get_short_phrase_override(text, target_norm)
         if short_override is not None:
+            log_translation_route("short-phrase", source_norm, target_norm, text)
             return await self.remember_translation_result(text, source_norm, target_norm, short_override)
 
         # Preserve Discord custom emojis/mentions/timestamps by translating only
@@ -2747,22 +2787,27 @@ class RelayBot(commands.Bot):
                     translated_parts.append(after)
 
             translated_with_tokens = "".join(translated_parts)
+            log_translation_route("protected-token-split", source_norm, target_norm, text)
             return normalize_translated_output_for_target(translated_with_tokens, target_norm)
 
         full_ai_translation = await self.translate_full_ai_if_needed(text, source_norm, target_norm)
         if full_ai_translation is not None:
+            log_translation_route("full-ai", source_norm, target_norm, text)
             return await self.remember_translation_result(text, source_norm, target_norm, full_ai_translation)
 
         arabic_ai_translation = await self.translate_arabic_with_ai_if_needed(text, source_norm, target_norm)
         if arabic_ai_translation is not None:
+            log_translation_route("arabic-ai", source_norm, target_norm, text)
             return await self.remember_translation_result(text, source_norm, target_norm, arabic_ai_translation)
 
         arabic_dialect_translation = await self.translate_arabic_dialect_text_if_needed(text, source_norm, target_norm)
         if arabic_dialect_translation is not None:
+            log_translation_route("arabic-dialect-rules", source_norm, target_norm, text)
             return await self.remember_translation_result(text, source_norm, target_norm, arabic_dialect_translation)
 
         korean_ai_translation = await self.translate_korean_with_ai_if_needed(text, source_norm, target_norm)
         if korean_ai_translation is not None:
+            log_translation_route("korean-ai", source_norm, target_norm, text)
             return await self.remember_translation_result(text, source_norm, target_norm, korean_ai_translation)
 
         original_text_for_cache = text
@@ -2777,6 +2822,7 @@ class RelayBot(commands.Bot):
         target_is_simplified = is_simplified_chinese_code(target_norm)
 
         if source_is_traditional and target_is_simplified:
+            log_translation_route("opencc-traditional-to-simplified", source_norm, target_norm, original_text_for_cache)
             return await self.remember_translation_result(
                 original_text_for_cache,
                 source_norm,
@@ -2785,6 +2831,7 @@ class RelayBot(commands.Bot):
             )
 
         if source_is_simplified and target_is_traditional:
+            log_translation_route("opencc-simplified-to-traditional", source_norm, target_norm, original_text_for_cache)
             return await self.remember_translation_result(
                 original_text_for_cache,
                 source_norm,
@@ -2848,6 +2895,10 @@ class RelayBot(commands.Bot):
 
         if target_is_traditional:
             translated_text = simplified_to_traditional(translated_text)
+            log_translation_route("libretranslate-opencc-traditional", source_norm, target_norm, original_text_for_cache)
+        else:
+            route_name = "libretranslate" if libre_source != libre_target else "libretranslate-same-code"
+            log_translation_route(route_name, source_norm, target_norm, original_text_for_cache)
 
         return await self.remember_translation_result(
             original_text_for_cache,
@@ -3104,6 +3155,100 @@ async def on_guild_join(guild: discord.Guild) -> None:
     log.info("Joined new server: %s (%s). Use /group_create and /group_add there to configure linked channels.", guild.name, guild.id)
 
 
+@bot.tree.command(name="help", description="Show setup steps, commands, and bot information.")
+async def help_command(interaction: discord.Interaction):
+    """Show a private help page for users and server admins."""
+    group_count = 0
+    linked_count = 0
+
+    if interaction.guild is not None:
+        try:
+            groups = await bot.list_groups(interaction.guild.id)
+            group_count = len(groups)
+            for row in groups:
+                channels = await bot.get_group_channels(interaction.guild.id, row["group_name"])
+                linked_count += len(channels)
+        except Exception as exc:
+            log.warning("Could not load guild setup summary for /help: %s", exc)
+
+    embed = discord.Embed(
+        title="MultiLang Relay Help",
+        description=(
+            "I mirror messages between linked language channels and translate them automatically.\n"
+            "Each Discord server has its own separate groups and channels, so setup in one server "
+            "does not affect any other server."
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="Quick setup",
+        value=(
+            "1. Create a group: `/group_create group_name:international`\n"
+            "2. Add English: `/group_add group_name:international channel:#english language_code:en`\n"
+            "3. Add other channels with codes like `ar`, `es`, `pt`, `ru`, `pl`, `tr`, `ko`, `zh-hans`, `zh-hant`.\n"
+            "4. Send a message in any linked channel and I will mirror it to the others."
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Commands",
+        value=(
+            "`/help` — show this help message\n"
+            "`/group_create` — create a translation group\n"
+            "`/group_add` — link a channel with a language code\n"
+            "`/group_list` — show this server's groups/channels\n"
+            "`/group_remove` — remove a linked channel\n"
+            "`/group_delete` — delete a whole group\n"
+            "`/languages` — show available LibreTranslate languages\n"
+            "`/test_translate` — test a translation privately"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Permissions needed",
+        value=(
+            "Setup commands require **Administrator** or **Manage Server**.\n"
+            "The bot needs **View Channel**, **Send Messages**, **Manage Webhooks**, "
+            "and **Read Message History** in linked channels."
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Features",
+        value=(
+            "✅ Multi-server separated setup\n"
+            "✅ Hybrid translation mode\n"
+            "✅ Arabic dialect AI helper\n"
+            "✅ Korean AI helper\n"
+            "✅ Reply context mirrors\n"
+            "✅ Edit/delete/reaction sync\n"
+            "✅ Custom emoji, sticker, GIF, and URL protection\n"
+            "✅ Database backups, cleanup, and persistent translation cache"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Current server setup",
+        value=(
+            f"Groups: `{group_count}`\n"
+            f"Linked channels: `{linked_count}`\n"
+            f"Translation mode: `{TRANSLATION_ENGINE}`\n"
+            f"Arabic AI: `{'on' if ENABLE_ARABIC_AI_TRANSLATION else 'off'}`\n"
+            f"Korean AI: `{'on' if ENABLE_KOREAN_AI_TRANSLATION else 'off'}`"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="This help message is private/ephemeral.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="group_create", description="Create a linked translation group.")
 @owner_or_manage_guild()
 @app_commands.describe(group_name="A short name for this linked channel set.")
@@ -3327,6 +3472,7 @@ async def relay_to_target(
     try:
         if pretranslated_text is not None:
             translated_text = pretranslated_text
+            log_translation_route("pretranslated-batch-result", source_lang, target["language_code"], original_text)
         else:
             translated_text = await bot.translate_text(original_text, source_lang, target["language_code"])
         final_content = translated_text.strip()
@@ -3343,6 +3489,7 @@ async def relay_to_target(
 
         used_fallback = True
         final_content = build_no_drop_fallback_content(source_lang, original_text, attachment_links)
+        log_translation_route("no-drop-fallback", source_lang, target["language_code"], original_text)
         log.warning(
             "Translation failed from %s to %s in group %s. Sending no-drop fallback instead. Error: %s",
             source_lang,
