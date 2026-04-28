@@ -3155,30 +3155,26 @@ async def on_guild_join(guild: discord.Guild) -> None:
     log.info("Joined new server: %s (%s). Use /group_create and /group_add there to configure linked channels.", guild.name, guild.id)
 
 
-@bot.tree.command(name="help", description="Show setup steps, commands, and bot information.")
+@bot.tree.command(name="help", description="Show setup steps and available commands.")
 async def help_command(interaction: discord.Interaction):
-    """Show a private help page for users and server admins."""
-    group_count = 0
-    linked_count = 0
-
-    if interaction.guild is not None:
-        try:
-            groups = await bot.list_groups(interaction.guild.id)
-            group_count = len(groups)
-            for row in groups:
-                channels = await bot.get_group_channels(interaction.guild.id, row["group_name"])
-                linked_count += len(channels)
-        except Exception as exc:
-            log.warning("Could not load guild setup summary for /help: %s", exc)
-
+    """Show a private, simple help page for users and server admins."""
     embed = discord.Embed(
         title="MultiLang Relay Help",
         description=(
-            "I mirror messages between linked language channels and translate them automatically.\n"
-            "Each Discord server has its own separate groups and channels, so setup in one server "
-            "does not affect any other server."
+            "I mirror messages between linked language channels and translate them automatically."
         ),
         color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="What I do",
+        value=(
+            "• Mirror messages from one linked language channel to the others.\n"
+            "• Translate text into each channel's language.\n"
+            "• Keep normal chat flow easy for international communities.\n"
+            "• Preserve common Discord items like mentions, emojis, stickers, GIFs, and links when possible."
+        ),
+        inline=False,
     )
 
     embed.add_field(
@@ -3201,50 +3197,23 @@ async def help_command(interaction: discord.Interaction):
             "`/group_list` — show this server's groups/channels\n"
             "`/group_remove` — remove a linked channel\n"
             "`/group_delete` — delete a whole group\n"
-            "`/languages` — show available LibreTranslate languages\n"
+            "`/languages` — show available translation languages\n"
             "`/test_translate` — test a translation privately"
         ),
         inline=False,
     )
 
     embed.add_field(
-        name="Permissions needed",
+        name="Language code examples",
         value=(
-            "Setup commands require **Administrator** or **Manage Server**.\n"
-            "The bot needs **View Channel**, **Send Messages**, **Manage Webhooks**, "
-            "and **Read Message History** in linked channels."
+            "`en` English, `ar` Arabic, `es` Spanish, `pt` Portuguese, `ru` Russian, "
+            "`pl` Polish, `tr` Turkish, `ko` Korean, `zh-hans` Simplified Chinese, "
+            "`zh-hant` Traditional Chinese."
         ),
         inline=False,
     )
 
-    embed.add_field(
-        name="Features",
-        value=(
-            "✅ Multi-server separated setup\n"
-            "✅ Hybrid translation mode\n"
-            "✅ Arabic dialect AI helper\n"
-            "✅ Korean AI helper\n"
-            "✅ Reply context mirrors\n"
-            "✅ Edit/delete/reaction sync\n"
-            "✅ Custom emoji, sticker, GIF, and URL protection\n"
-            "✅ Database backups, cleanup, and persistent translation cache"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="Current server setup",
-        value=(
-            f"Groups: `{group_count}`\n"
-            f"Linked channels: `{linked_count}`\n"
-            f"Translation mode: `{TRANSLATION_ENGINE}`\n"
-            f"Arabic AI: `{'on' if ENABLE_ARABIC_AI_TRANSLATION else 'off'}`\n"
-            f"Korean AI: `{'on' if ENABLE_KOREAN_AI_TRANSLATION else 'off'}`"
-        ),
-        inline=False,
-    )
-
-    embed.set_footer(text="This help message is private/ephemeral.")
+    embed.set_footer(text="Only you can see this help message.")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
