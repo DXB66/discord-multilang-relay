@@ -94,6 +94,23 @@ KOREAN_AI_NUM_PREDICT = max(80, int(os.getenv("KOREAN_AI_NUM_PREDICT", "220")))
 KOREAN_AI_KEEP_ALIVE = os.getenv("KOREAN_AI_KEEP_ALIVE", ARABIC_AI_KEEP_ALIVE)
 KOREAN_AI_WARMUP_ON_START = os.getenv("KOREAN_AI_WARMUP_ON_START", "true").lower() in {"1", "true", "yes", "on"}
 
+# Optional full-AI translation test mode.
+# Default "hybrid" keeps the current setup:
+# - LibreTranslate for normal translations
+# - Aya/Ollama only for Arabic/Korean weak spots
+#
+# Set TRANSLATION_ENGINE=ai to route all text translations through the local
+# Ollama/Aya model first, with LibreTranslate kept as fallback if AI fails.
+TRANSLATION_ENGINE = os.getenv("TRANSLATION_ENGINE", "hybrid").strip().lower()
+ENABLE_FULL_AI_TRANSLATION = TRANSLATION_ENGINE in {"ai", "full_ai", "ollama", "local_ai"}
+FULL_AI_URL = os.getenv("FULL_AI_URL", ARABIC_AI_URL)
+FULL_AI_MODEL = os.getenv("FULL_AI_MODEL", ARABIC_AI_MODEL)
+FULL_AI_TIMEOUT = max(10.0, float(os.getenv("FULL_AI_TIMEOUT", str(ARABIC_AI_TIMEOUT))))
+FULL_AI_MAX_CHARS = max(100, int(os.getenv("FULL_AI_MAX_CHARS", "800")))
+FULL_AI_NUM_PREDICT = max(80, int(os.getenv("FULL_AI_NUM_PREDICT", "260")))
+FULL_AI_KEEP_ALIVE = os.getenv("FULL_AI_KEEP_ALIVE", ARABIC_AI_KEEP_ALIVE)
+FULL_AI_WARMUP_ON_START = os.getenv("FULL_AI_WARMUP_ON_START", "true").lower() in {"1", "true", "yes", "on"}
+
 
 def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_]+", "_", original_name).strip("_") or "emoji"
@@ -209,6 +226,49 @@ def normalize_chat_slang_for_translation(text: str, source_lang: str) -> str:
         return match_case_replacement(original, replacement)
 
     return CHAT_SLANG_RE.sub(replace, text)
+
+
+LANGUAGE_DISPLAY_NAMES: dict[str, str] = {
+    "auto": "the source language",
+    "en": "English",
+    "ar": "Arabic",
+    "pt": "Portuguese",
+    "es": "Spanish",
+    "ru": "Russian",
+    "pl": "Polish",
+    "tr": "Turkish",
+    "ko": "Korean",
+    "zh": "Simplified Chinese",
+    "zh-hans": "Simplified Chinese",
+    "zh-cn": "Simplified Chinese",
+    "zh-sg": "Simplified Chinese",
+    "zt": "Traditional Chinese",
+    "zh-hant": "Traditional Chinese",
+    "zh-tw": "Traditional Chinese",
+    "zh-hk": "Traditional Chinese",
+    "zh-mo": "Traditional Chinese",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "ja": "Japanese",
+    "nl": "Dutch",
+    "id": "Indonesian",
+    "hi": "Hindi",
+    "ur": "Urdu",
+}
+
+
+def language_display_name(code: str) -> str:
+    normalized = canonical_language_code(code)
+    if normalized in LANGUAGE_DISPLAY_NAMES:
+        return LANGUAGE_DISPLAY_NAMES[normalized]
+
+    base = normalized.split("-", 1)[0]
+    if base in LANGUAGE_DISPLAY_NAMES:
+        return LANGUAGE_DISPLAY_NAMES[base]
+
+    # Last-resort label for custom language codes.
+    return normalized.upper()
 
 
 # LibreTranslate/Argos can be weak with Arabic dialects such as Egyptian Arabic.
@@ -679,6 +739,8 @@ class RelayBot(commands.Bot):
         self.arabic_ai_pivot_cache: dict[str, str] = {}
         self.korean_ai_lock = asyncio.Lock()
         self.korean_ai_cache: dict[tuple[str, str, str], str] = {}
+        self.full_ai_lock = asyncio.Lock()
+        self.full_ai_cache: dict[tuple[str, str, str], str] = {}
 
     async def setup_hook(self) -> None:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -695,6 +757,9 @@ class RelayBot(commands.Bot):
         if ENABLE_KOREAN_AI_TRANSLATION and KOREAN_AI_WARMUP_ON_START:
             # Same model as Arabic by default. This keeps Aya warm for Korean too.
             asyncio.create_task(self.warmup_korean_ai_model())
+
+        if ENABLE_FULL_AI_TRANSLATION and FULL_AI_WARMUP_ON_START:
+            asyncio.create_task(self.warmup_full_ai_model())
 
         synced = await self.tree.sync()
         log.info(
@@ -1255,6 +1320,37 @@ class RelayBot(commands.Bot):
         except Exception as exc:
             log.warning("Korean AI model warmup failed. The bot will still fallback normally. Error: %s", exc)
 
+    async def warmup_full_ai_model(self) -> None:
+        """Preload the local Ollama model for full-AI translation test mode."""
+        await asyncio.sleep(4)
+
+        if not ENABLE_FULL_AI_TRANSLATION:
+            return
+
+        assert self.http_session is not None
+
+        payload = {
+            "model": FULL_AI_MODEL,
+            "stream": False,
+            "keep_alive": FULL_AI_KEEP_ALIVE,
+            "prompt": "",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=min(max(FULL_AI_TIMEOUT, 10.0), 60.0))
+
+        try:
+            async with self.http_session.post(FULL_AI_URL, json=payload, timeout=timeout) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"Ollama warmup error {response.status}: {body}")
+            log.info(
+                "Full AI translation model warmup requested for %s with keep_alive=%s.",
+                FULL_AI_MODEL,
+                FULL_AI_KEEP_ALIVE,
+            )
+        except Exception as exc:
+            log.warning("Full AI model warmup failed. The bot will still fallback normally. Error: %s", exc)
+
     def clean_arabic_ai_response(self, response_text: str) -> str:
         cleaned = response_text.strip()
 
@@ -1509,6 +1605,105 @@ class RelayBot(commands.Bot):
         # Any non-Korean source directly to Korean.
         return korean_ai_translation
 
+    async def get_full_ai_translation(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
+        """Use local Ollama/Aya for full translation-engine=ai test mode.
+
+        LibreTranslate remains available as fallback. This method only returns a
+        value when TRANSLATION_ENGINE=ai and the local AI request succeeds.
+        """
+        cleaned_text = text.strip()
+        if not ENABLE_FULL_AI_TRANSLATION:
+            return None
+
+        if not cleaned_text:
+            return None
+
+        source_norm = canonical_language_code(source_norm)
+        target_norm = canonical_language_code(target_norm)
+        if source_norm == target_norm:
+            return text
+
+        if len(cleaned_text) > FULL_AI_MAX_CHARS:
+            log.info(
+                "Full AI translator skipped message because it is too long (%s > %s chars).",
+                len(cleaned_text),
+                FULL_AI_MAX_CHARS,
+            )
+            return None
+
+        cache_key = (source_norm, target_norm, cleaned_text)
+        cached = self.full_ai_cache.get(cache_key)
+        if cached:
+            return cached
+
+        async with self.full_ai_lock:
+            cached = self.full_ai_cache.get(cache_key)
+            if cached:
+                return cached
+
+            assert self.http_session is not None
+
+            source_name = language_display_name(source_norm)
+            target_name = language_display_name(target_norm)
+
+            prompt = (
+                "You are a professional Discord chat translator. "
+                f"Translate the message from {source_name} to {target_name}. "
+                "Use natural language suitable for Discord chat while preserving the exact meaning, tone, and slang. "
+                "Preserve line breaks, names, mentions, role/channel mentions, links, numbers, emoji text, and custom emoji tokens. "
+                "Do not add explanations, quotes, labels, markdown code fences, or extra commentary. "
+                "Return only the translated message.\n\n"
+                f"{cleaned_text}"
+            )
+
+            payload = {
+                "model": FULL_AI_MODEL,
+                "stream": False,
+                "keep_alive": FULL_AI_KEEP_ALIVE,
+                "options": {
+                    "temperature": 0,
+                    "num_predict": FULL_AI_NUM_PREDICT,
+                },
+                "prompt": prompt,
+            }
+
+            timeout = aiohttp.ClientTimeout(total=FULL_AI_TIMEOUT)
+
+            try:
+                async with self.http_session.post(FULL_AI_URL, json=payload, timeout=timeout) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        raise RuntimeError(f"Ollama full AI error {response.status}: {body}")
+
+                    data = await response.json()
+                    response_text = data.get("response")
+                    if not response_text:
+                        raise RuntimeError(f"Unexpected Ollama full AI response: {data}")
+
+                    translated = self.clean_arabic_ai_response(str(response_text))
+                    if not translated:
+                        raise RuntimeError("Ollama full AI returned an empty translation.")
+
+                    if len(self.full_ai_cache) > 512:
+                        self.full_ai_cache.clear()
+                    self.full_ai_cache[cache_key] = translated
+
+                    log.info("Full AI translator handled %s -> %s.", source_norm, target_norm)
+                    return translated
+            except Exception as exc:
+                log.warning("Full AI translator failed; falling back to hybrid/LibreTranslate. Error: %s", exc)
+                return None
+
+    async def translate_full_ai_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
+        if not ENABLE_FULL_AI_TRANSLATION:
+            return None
+
+        translation = await self.get_full_ai_translation(text, source_norm, target_norm)
+        if translation is None:
+            return None
+
+        return normalize_translated_output_for_target(translation, target_norm)
+
     async def translate_arabic_dialect_text_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
         """Translate known Arabic/Egyptian dialect phrases through an English pivot.
 
@@ -1645,6 +1840,10 @@ class RelayBot(commands.Bot):
                     translated_parts.append(after)
 
             return normalize_translated_output_for_target("".join(translated_parts), target_norm)
+
+        full_ai_translation = await self.translate_full_ai_if_needed(text, source_norm, target_norm)
+        if full_ai_translation is not None:
+            return full_ai_translation
 
         arabic_ai_translation = await self.translate_arabic_with_ai_if_needed(text, source_norm, target_norm)
         if arabic_ai_translation is not None:
