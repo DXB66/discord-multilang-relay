@@ -114,6 +114,8 @@ FULL_AI_WARMUP_ON_START = os.getenv("FULL_AI_WARMUP_ON_START", "true").lower() i
 FULL_AI_BATCH_TRANSLATION = os.getenv("FULL_AI_BATCH_TRANSLATION", "true").lower() in {"1", "true", "yes", "on"}
 FULL_AI_BATCH_MAX_TARGETS = max(1, int(os.getenv("FULL_AI_BATCH_MAX_TARGETS", "12")))
 FULL_AI_BATCH_NUM_PREDICT = max(200, int(os.getenv("FULL_AI_BATCH_NUM_PREDICT", "900")))
+FULL_AI_BATCH_TIMEOUT = max(5.0, float(os.getenv("FULL_AI_BATCH_TIMEOUT", "15")))
+FULL_AI_PER_TARGET_AFTER_BATCH_FAILURE = os.getenv("FULL_AI_PER_TARGET_AFTER_BATCH_FAILURE", "false").lower() in {"1", "true", "yes", "on"}
 
 
 def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
@@ -995,6 +997,7 @@ class RelayBot(commands.Bot):
         self.full_ai_lock = asyncio.Lock()
         self.full_ai_cache: dict[tuple[str, str, str], str] = {}
         self.full_ai_batch_cache: dict[tuple[str, tuple[str, ...], str], dict[str, str]] = {}
+        self.full_ai_batch_failed_messages: set[tuple[str, str]] = set()
 
     async def setup_hook(self) -> None:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -1890,6 +1893,12 @@ class RelayBot(commands.Bot):
             return None
 
         cache_text = normalize_ai_cache_text(cleaned_text)
+        if (
+            not FULL_AI_PER_TARGET_AFTER_BATCH_FAILURE
+            and (source_norm, cache_text) in self.full_ai_batch_failed_messages
+        ):
+            return None
+
         cache_key = (source_norm, target_norm, cache_text)
         cached = self.full_ai_cache.get(cache_key)
         if cached:
@@ -2103,7 +2112,7 @@ class RelayBot(commands.Bot):
                 "prompt": prompt,
             }
 
-            timeout = aiohttp.ClientTimeout(total=FULL_AI_TIMEOUT)
+            timeout = aiohttp.ClientTimeout(total=FULL_AI_BATCH_TIMEOUT)
 
             try:
                 async with self.http_session.post(FULL_AI_URL, json=payload, timeout=timeout) as response:
@@ -2141,7 +2150,16 @@ class RelayBot(commands.Bot):
                     )
                     return results
             except Exception as exc:
-                log.warning("Full AI batch translator failed; falling back to per-target translation. Error: %s", exc)
+                # If a batch request times out or fails, do not then run slow
+                # per-target AI translations for the same source message unless
+                # explicitly enabled. Fall back to the normal hybrid/LibreTranslate
+                # path instead, so one failed batch does not cause a long message
+                # delay across every linked channel.
+                if not FULL_AI_PER_TARGET_AFTER_BATCH_FAILURE:
+                    self.full_ai_batch_failed_messages.add((source_norm, cache_text))
+                    if len(self.full_ai_batch_failed_messages) > 512:
+                        self.full_ai_batch_failed_messages.clear()
+                log.warning("Full AI batch translator failed; falling back to hybrid/LibreTranslate path. Error: %r", exc)
                 return results
 
     async def translate_full_ai_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
