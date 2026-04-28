@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,28 @@ LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://localhost:5000").rs
 # Multi-server mode: commands are registered globally, and each server keeps its
 # own configuration in the database by guild_id. Do not set a GUILD_ID.
 DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
+
+# Automatic VPS-side database backups. Backups are saved inside the Docker data
+# volume by default, usually visible on the VPS at:
+# /opt/discord-multilang-relay/data/backups/
+ENABLE_DB_BACKUPS = os.getenv("ENABLE_DB_BACKUPS", "true").lower() in {"1", "true", "yes", "on"}
+DB_BACKUP_DIR = os.getenv("DB_BACKUP_DIR", str(Path(DB_PATH).parent / "backups"))
+DB_BACKUP_INTERVAL_HOURS = max(1.0, float(os.getenv("DB_BACKUP_INTERVAL_HOURS", "24")))
+DB_BACKUP_KEEP_DAYS = max(1, int(os.getenv("DB_BACKUP_KEEP_DAYS", "14")))
+
+# Cleanup old relay records so edit/delete/reaction-sync metadata does not grow
+# forever. This does not delete Discord messages, only old mapping records.
+ENABLE_RELAY_RECORD_CLEANUP = os.getenv("ENABLE_RELAY_RECORD_CLEANUP", "true").lower() in {"1", "true", "yes", "on"}
+RELAY_RECORD_RETENTION_DAYS = max(1, int(os.getenv("RELAY_RECORD_RETENTION_DAYS", "30")))
+RELAY_RECORD_CLEANUP_INTERVAL_HOURS = max(1.0, float(os.getenv("RELAY_RECORD_CLEANUP_INTERVAL_HOURS", "24")))
+
+# Persistent translation cache. This survives bot restarts and makes repeated
+# phrases/messages faster, especially for AI-assisted Arabic/Korean translations.
+ENABLE_TRANSLATION_CACHE = os.getenv("ENABLE_TRANSLATION_CACHE", "true").lower() in {"1", "true", "yes", "on"}
+TRANSLATION_CACHE_MAX_ROWS = max(100, int(os.getenv("TRANSLATION_CACHE_MAX_ROWS", "5000")))
+TRANSLATION_CACHE_TTL_DAYS = max(1, int(os.getenv("TRANSLATION_CACHE_TTL_DAYS", "30")))
+TRANSLATION_CACHE_MAX_CHARS = max(50, int(os.getenv("TRANSLATION_CACHE_MAX_CHARS", "800")))
+
 
 ENFORCE_SOURCE_LANGUAGE = os.getenv("ENFORCE_SOURCE_LANGUAGE", "true").lower() in {"1", "true", "yes", "on"}
 DETECT_MIN_TEXT_LENGTH = int(os.getenv("DETECT_MIN_TEXT_LENGTH", "4"))
@@ -116,12 +139,6 @@ FULL_AI_BATCH_MAX_TARGETS = max(1, int(os.getenv("FULL_AI_BATCH_MAX_TARGETS", "1
 FULL_AI_BATCH_NUM_PREDICT = max(200, int(os.getenv("FULL_AI_BATCH_NUM_PREDICT", "900")))
 FULL_AI_BATCH_TIMEOUT = max(5.0, float(os.getenv("FULL_AI_BATCH_TIMEOUT", "15")))
 FULL_AI_PER_TARGET_AFTER_BATCH_FAILURE = os.getenv("FULL_AI_PER_TARGET_AFTER_BATCH_FAILURE", "false").lower() in {"1", "true", "yes", "on"}
-
-# Webhook messages cannot reliably create Discord's native reply bubble while
-# also preserving the original user's name/avatar. Instead, mirrored replies can
-# include a small translated context line above the message.
-ENABLE_REPLY_CONTEXT = os.getenv("ENABLE_REPLY_CONTEXT", "true").lower() in {"1", "true", "yes", "on"}
-REPLY_CONTEXT_MAX_CHARS = max(40, int(os.getenv("REPLY_CONTEXT_MAX_CHARS", "180")))
 
 
 def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
@@ -298,6 +315,26 @@ def normalize_ai_cache_text(text: str) -> str:
         return cleaned.lower()
 
     return cleaned
+
+
+def should_use_persistent_translation_cache(text: str) -> bool:
+    """Return True when a translation is safe/useful to persist in SQLite."""
+    if not ENABLE_TRANSLATION_CACHE:
+        return False
+
+    cleaned = text.strip()
+    if not cleaned:
+        return False
+
+    if len(cleaned) > TRANSLATION_CACHE_MAX_CHARS:
+        return False
+
+    # Avoid caching messages that contain Discord IDs, URLs, or emoji tokens.
+    # Those can be user/server-specific and are already protected separately.
+    if DISCORD_PROTECTED_TOKEN_RE.search(cleaned):
+        return False
+
+    return True
 
 
 COMMON_PHRASE_RE = re.compile(r"^(?P<prefix>\s*)(?P<body>[A-Za-z' ]+?)(?P<punct>[.!?。！？…]*)\s*$", re.DOTALL)
@@ -846,101 +883,6 @@ def get_message_sticker_links(message: discord.Message) -> list[str]:
     return links
 
 
-def compact_reply_context_text(text: str, max_chars: int = REPLY_CONTEXT_MAX_CHARS) -> str:
-    """Make a one-line reply preview that is short enough for Discord mirrors."""
-    compacted = " ".join((text or "").strip().split())
-    if not compacted:
-        return ""
-
-    if len(compacted) <= max_chars:
-        return compacted
-
-    return compacted[: max_chars - 1].rstrip() + "…"
-
-
-def get_message_reply_preview(message: discord.Message) -> str:
-    """Build a short preview for the message being replied to."""
-    content = compact_reply_context_text(message.content or "")
-    if content:
-        return content
-
-    if getattr(message, "stickers", None):
-        return "sticker"
-
-    if getattr(message, "attachments", None):
-        return "attachment"
-
-    return "message"
-
-
-async def get_reply_context_for_message(message: discord.Message) -> Optional[dict[str, str]]:
-    """Return author/text preview for a replied-to message, if any."""
-    if not ENABLE_REPLY_CONTEXT:
-        return None
-
-    reference = getattr(message, "reference", None)
-    if reference is None or getattr(reference, "message_id", None) is None:
-        return None
-
-    referenced = getattr(reference, "resolved", None)
-    if not isinstance(referenced, discord.Message):
-        channel_id = getattr(reference, "channel_id", None) or message.channel.id
-        channel = await resolve_text_channel(int(channel_id))
-        if channel is None:
-            return None
-
-        try:
-            referenced = await channel.fetch_message(int(reference.message_id))
-        except discord.NotFound:
-            return None
-        except Exception:
-            log.exception("Failed to fetch replied-to message %s for reply context", reference.message_id)
-            return None
-
-    author_name = getattr(referenced.author, "display_name", None) or getattr(referenced.author, "name", "Unknown")
-    author_name = compact_reply_context_text(str(author_name), 48)
-    preview = get_message_reply_preview(referenced)
-
-    if not preview:
-        return None
-
-    return {
-        "author": author_name,
-        "text": preview,
-    }
-
-
-async def build_reply_context_prefix(
-    reply_context: Optional[dict[str, str]],
-    source_lang: str,
-    target_lang: str,
-) -> str:
-    """Build a translated quote-style line for mirrored replies."""
-    if not reply_context:
-        return ""
-
-    author = reply_context.get("author") or "Unknown"
-    preview = reply_context.get("text") or ""
-    preview = compact_reply_context_text(preview)
-    if not preview:
-        return ""
-
-    translated_preview = preview
-    try:
-        translated_preview = await bot.translate_text(preview, source_lang, target_lang)
-    except Exception as exc:
-        # Reply context is nice-to-have. Never block the main relay because of it.
-        log.warning(
-            "Could not translate reply context from %s to %s. Using original preview. Error: %s",
-            source_lang,
-            target_lang,
-            exc,
-        )
-
-    translated_preview = compact_reply_context_text(translated_preview)
-    return f"> ↪ {author}: {translated_preview}\n\n"
-
-
 def split_text_for_limit(text: str, limit: int) -> list[str]:
     cleaned = text.strip()
     if not cleaned:
@@ -1119,6 +1061,12 @@ class RelayBot(commands.Bot):
         if ENABLE_FULL_AI_TRANSLATION and FULL_AI_WARMUP_ON_START:
             asyncio.create_task(self.warmup_full_ai_model())
 
+        if ENABLE_DB_BACKUPS:
+            asyncio.create_task(self.database_backup_loop())
+
+        if ENABLE_RELAY_RECORD_CLEANUP or ENABLE_TRANSLATION_CACHE:
+            asyncio.create_task(self.database_maintenance_loop())
+
         synced = await self.tree.sync()
         log.info(
             "Synced %s global command(s). Multi-server mode is enabled; "
@@ -1164,6 +1112,7 @@ class RelayBot(commands.Bot):
                 target_channel_id INTEGER NOT NULL,
                 target_message_id INTEGER NOT NULL,
                 target_index INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (target_message_id),
                 UNIQUE (source_message_id, target_channel_id, target_index)
             );
@@ -1177,9 +1126,55 @@ class RelayBot(commands.Bot):
                 app_emoji_animated INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS translation_cache (
+                source_lang TEXT NOT NULL,
+                target_lang TEXT NOT NULL,
+                cache_text TEXT NOT NULL,
+                translated_text TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                uses INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (source_lang, target_lang, cache_text)
+            );
             """
         )
+        await self.ensure_db_migrations()
         await self.db.commit()
+
+    async def ensure_db_migrations(self) -> None:
+        """Apply lightweight SQLite migrations for existing bot.db files."""
+        assert self.db is not None
+
+        cursor = await self.db.execute("PRAGMA table_info(relayed_messages)")
+        relayed_columns = {row[1] for row in await cursor.fetchall()}
+        await cursor.close()
+
+        if "created_at" not in relayed_columns:
+            await self.db.execute("ALTER TABLE relayed_messages ADD COLUMN created_at TEXT")
+            await self.db.execute(
+                "UPDATE relayed_messages SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"
+            )
+
+        cursor = await self.db.execute("PRAGMA table_info(translation_cache)")
+        cache_columns = {row[1] for row in await cursor.fetchall()}
+        await cursor.close()
+
+        # Future-proofing in case an old test version created this table partially.
+        required_cache_columns = {
+            "source_lang",
+            "target_lang",
+            "cache_text",
+            "translated_text",
+            "created_at",
+            "last_used_at",
+            "uses",
+        }
+        if cache_columns and not required_cache_columns.issubset(cache_columns):
+            log.warning(
+                "translation_cache table exists but has an unexpected schema. "
+                "Persistent translation cache may be skipped until the table is fixed."
+            )
 
     async def get_group_channels(self, guild_id: int, group_name: str):
         assert self.db is not None
@@ -1311,9 +1306,10 @@ class RelayBot(commands.Bot):
                     source_message_id,
                     target_channel_id,
                     target_message_id,
-                    target_index
+                    target_index,
+                    created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 (
                     guild_id,
@@ -1708,6 +1704,238 @@ class RelayBot(commands.Bot):
             )
         except Exception as exc:
             log.warning("Full AI model warmup failed. The bot will still fallback normally. Error: %s", exc)
+
+    async def backup_database_once(self) -> Optional[Path]:
+        """Create one SQLite backup on the VPS disk."""
+        assert self.db is not None
+
+        backup_dir = Path(DB_BACKUP_DIR)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        stamp = time.strftime("%Y-%m-%d-%H%M%S")
+        backup_path = backup_dir / f"bot-{stamp}.db"
+        tmp_path = backup_path.with_suffix(".db.tmp")
+
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+            async with aiosqlite.connect(str(tmp_path)) as backup_db:
+                await self.db.backup(backup_db)
+
+            tmp_path.replace(backup_path)
+            await self.cleanup_old_database_backups()
+            log.info("Created database backup: %s", backup_path)
+            return backup_path
+        except Exception as exc:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            log.warning("Database backup failed: %s", exc)
+            return None
+
+    async def cleanup_old_database_backups(self) -> None:
+        backup_dir = Path(DB_BACKUP_DIR)
+        if not backup_dir.exists():
+            return
+
+        cutoff = time.time() - (DB_BACKUP_KEEP_DAYS * 86400)
+        removed = 0
+
+        for backup_file in backup_dir.glob("bot-*.db"):
+            try:
+                if backup_file.stat().st_mtime < cutoff:
+                    backup_file.unlink()
+                    removed += 1
+            except Exception as exc:
+                log.warning("Could not remove old DB backup %s: %s", backup_file, exc)
+
+        if removed:
+            log.info("Removed %s old database backup(s).", removed)
+
+    async def database_backup_loop(self) -> None:
+        await asyncio.sleep(30)
+
+        while not self.is_closed():
+            await self.backup_database_once()
+            await asyncio.sleep(DB_BACKUP_INTERVAL_HOURS * 3600)
+
+    async def cleanup_old_relay_records(self) -> int:
+        if not ENABLE_RELAY_RECORD_CLEANUP:
+            return 0
+
+        assert self.db is not None
+        cutoff_modifier = f"-{RELAY_RECORD_RETENTION_DAYS} days"
+        cursor = await self.db.execute(
+            """
+            DELETE FROM relayed_messages
+            WHERE created_at IS NOT NULL
+              AND created_at < datetime('now', ?)
+            """,
+            (cutoff_modifier,),
+        )
+        removed = cursor.rowcount if cursor.rowcount is not None else 0
+        await cursor.close()
+        await self.db.commit()
+
+        if removed:
+            log.info("Cleaned up %s old relay record(s).", removed)
+
+        return int(removed or 0)
+
+    async def prune_translation_cache(self) -> None:
+        if not ENABLE_TRANSLATION_CACHE:
+            return
+
+        assert self.db is not None
+
+        ttl_modifier = f"-{TRANSLATION_CACHE_TTL_DAYS} days"
+        await self.db.execute(
+            """
+            DELETE FROM translation_cache
+            WHERE last_used_at < datetime('now', ?)
+            """,
+            (ttl_modifier,),
+        )
+
+        await self.db.execute(
+            """
+            DELETE FROM translation_cache
+            WHERE rowid IN (
+                SELECT rowid
+                FROM translation_cache
+                ORDER BY last_used_at DESC, uses DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (TRANSLATION_CACHE_MAX_ROWS,),
+        )
+        await self.db.commit()
+
+    async def database_maintenance_loop(self) -> None:
+        await asyncio.sleep(45)
+
+        intervals = []
+        if ENABLE_RELAY_RECORD_CLEANUP:
+            intervals.append(RELAY_RECORD_CLEANUP_INTERVAL_HOURS)
+        if ENABLE_TRANSLATION_CACHE:
+            intervals.append(24.0)
+
+        sleep_hours = min(intervals) if intervals else 24.0
+
+        while not self.is_closed():
+            try:
+                await self.cleanup_old_relay_records()
+                await self.prune_translation_cache()
+            except Exception as exc:
+                log.warning("Database maintenance failed: %s", exc)
+
+            await asyncio.sleep(sleep_hours * 3600)
+
+    async def get_cached_translation(self, text: str, source_lang: str, target_lang: str) -> Optional[str]:
+        if not should_use_persistent_translation_cache(text):
+            return None
+
+        assert self.db is not None
+
+        source_norm = canonical_language_code(source_lang)
+        target_norm = canonical_language_code(target_lang)
+        cache_text = normalize_ai_cache_text(text)
+
+        cursor = await self.db.execute(
+            """
+            SELECT translated_text
+            FROM translation_cache
+            WHERE source_lang = ? AND target_lang = ? AND cache_text = ?
+            """,
+            (source_norm, target_norm, cache_text),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+
+        if row is None:
+            return None
+
+        await self.db.execute(
+            """
+            UPDATE translation_cache
+            SET last_used_at = CURRENT_TIMESTAMP,
+                uses = uses + 1
+            WHERE source_lang = ? AND target_lang = ? AND cache_text = ?
+            """,
+            (source_norm, target_norm, cache_text),
+        )
+        await self.db.commit()
+
+        log.debug("Persistent translation cache hit for %s -> %s.", source_norm, target_norm)
+        return str(row["translated_text"])
+
+    async def set_cached_translation(self, text: str, source_lang: str, target_lang: str, translated_text: str) -> None:
+        if not should_use_persistent_translation_cache(text):
+            return
+
+        cleaned_translation = translated_text.strip()
+        if not cleaned_translation:
+            return
+
+        assert self.db is not None
+
+        source_norm = canonical_language_code(source_lang)
+        target_norm = canonical_language_code(target_lang)
+
+        if source_norm == target_norm:
+            return
+
+        cache_text = normalize_ai_cache_text(text)
+
+        await self.db.execute(
+            """
+            INSERT INTO translation_cache (
+                source_lang,
+                target_lang,
+                cache_text,
+                translated_text,
+                created_at,
+                last_used_at,
+                uses
+            )
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+            ON CONFLICT(source_lang, target_lang, cache_text) DO UPDATE SET
+                translated_text = excluded.translated_text,
+                last_used_at = CURRENT_TIMESTAMP,
+                uses = translation_cache.uses + 1
+            """,
+            (source_norm, target_norm, cache_text, cleaned_translation),
+        )
+
+        await self.db.execute(
+            """
+            DELETE FROM translation_cache
+            WHERE rowid IN (
+                SELECT rowid
+                FROM translation_cache
+                ORDER BY last_used_at DESC, uses DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (TRANSLATION_CACHE_MAX_ROWS,),
+        )
+        await self.db.commit()
+
+    async def remember_translation_result(
+        self,
+        original_text: str,
+        source_lang: str,
+        target_lang: str,
+        translated_text: str,
+    ) -> str:
+        normalized = normalize_translated_output_for_target(translated_text, target_lang)
+        await self.set_cached_translation(original_text, source_lang, target_lang, normalized)
+        return normalized
+
+
 
     def clean_arabic_ai_response(self, response_text: str) -> str:
         cleaned = response_text.strip()
@@ -2378,13 +2606,17 @@ class RelayBot(commands.Bot):
         if source_norm == target_norm:
             return text
 
+        cached_translation = await self.get_cached_translation(text, source_norm, target_norm)
+        if cached_translation is not None:
+            return normalize_translated_output_for_target(cached_translation, target_norm)
+
         common_translation = get_common_phrase_translation(text, source_norm, target_norm)
         if common_translation is not None:
-            return common_translation
+            return await self.remember_translation_result(text, source_norm, target_norm, common_translation)
 
         short_override = get_short_phrase_override(text, target_norm)
         if short_override is not None:
-            return short_override
+            return await self.remember_translation_result(text, source_norm, target_norm, short_override)
 
         # Preserve Discord custom emojis/mentions/timestamps by translating only
         # the normal text around them, then putting the original token back.
@@ -2412,24 +2644,26 @@ class RelayBot(commands.Bot):
                 else:
                     translated_parts.append(after)
 
-            return normalize_translated_output_for_target("".join(translated_parts), target_norm)
+            translated_with_tokens = "".join(translated_parts)
+            return normalize_translated_output_for_target(translated_with_tokens, target_norm)
 
         full_ai_translation = await self.translate_full_ai_if_needed(text, source_norm, target_norm)
         if full_ai_translation is not None:
-            return full_ai_translation
+            return await self.remember_translation_result(text, source_norm, target_norm, full_ai_translation)
 
         arabic_ai_translation = await self.translate_arabic_with_ai_if_needed(text, source_norm, target_norm)
         if arabic_ai_translation is not None:
-            return arabic_ai_translation
+            return await self.remember_translation_result(text, source_norm, target_norm, arabic_ai_translation)
 
         arabic_dialect_translation = await self.translate_arabic_dialect_text_if_needed(text, source_norm, target_norm)
         if arabic_dialect_translation is not None:
-            return arabic_dialect_translation
+            return await self.remember_translation_result(text, source_norm, target_norm, arabic_dialect_translation)
 
         korean_ai_translation = await self.translate_korean_with_ai_if_needed(text, source_norm, target_norm)
         if korean_ai_translation is not None:
-            return korean_ai_translation
+            return await self.remember_translation_result(text, source_norm, target_norm, korean_ai_translation)
 
+        original_text_for_cache = text
         text = normalize_chat_slang_for_translation(text, source_norm)
 
         # LibreTranslate's direct Traditional Chinese target model can produce
@@ -2441,10 +2675,20 @@ class RelayBot(commands.Bot):
         target_is_simplified = is_simplified_chinese_code(target_norm)
 
         if source_is_traditional and target_is_simplified:
-            return traditional_to_simplified(text)
+            return await self.remember_translation_result(
+                original_text_for_cache,
+                source_norm,
+                target_norm,
+                traditional_to_simplified(text),
+            )
 
         if source_is_simplified and target_is_traditional:
-            return simplified_to_traditional(text)
+            return await self.remember_translation_result(
+                original_text_for_cache,
+                source_norm,
+                target_norm,
+                simplified_to_traditional(text),
+            )
 
         libre_source = libretranslate_language_code(source_norm)
         libre_target = "zh" if target_is_traditional else libretranslate_language_code(target_norm)
@@ -2501,9 +2745,14 @@ class RelayBot(commands.Bot):
             translated_text = "".join(translated_chunks)
 
         if target_is_traditional:
-            return simplified_to_traditional(translated_text)
+            translated_text = simplified_to_traditional(translated_text)
 
-        return normalize_translated_output_for_target(translated_text, target_norm)
+        return await self.remember_translation_result(
+            original_text_for_cache,
+            source_norm,
+            target_norm,
+            translated_text,
+        )
 
     async def get_languages(self) -> list[dict]:
         assert self.http_session is not None
@@ -2958,7 +3207,6 @@ async def relay_to_target(
     avatar_url: str,
     existing_message_ids: Optional[list[int]] = None,
     pretranslated_text: Optional[str] = None,
-    reply_context: Optional[dict[str, str]] = None,
 ) -> tuple[int, list[int]] | None:
     if message.guild is None:
         return None
@@ -3004,14 +3252,6 @@ async def relay_to_target(
         if final_content:
             final_content += "\n\n"
         final_content += "\n".join(attachment_links)
-
-    reply_prefix = await build_reply_context_prefix(
-        reply_context,
-        source_lang,
-        target["language_code"],
-    )
-    if reply_prefix:
-        final_content = f"{reply_prefix}{final_content}".strip()
 
     if not final_content:
         return None
@@ -3084,7 +3324,6 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
         attachment_links.extend(sticker_links)
     display_name = message.author.display_name
     avatar_url = message.author.display_avatar.url
-    reply_context = await get_reply_context_for_message(message)
 
     if ENFORCE_SOURCE_LANGUAGE and original_text.strip():
         try:
@@ -3159,7 +3398,6 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
                 avatar_url=avatar_url,
                 existing_message_ids=existing_records_by_target.get(target["channel_id"]),
                 pretranslated_text=pretranslated_by_channel.get(target["channel_id"]),
-                reply_context=reply_context,
             )
 
     results = await asyncio.gather(*(run_relay(target) for target in relay_targets), return_exceptions=True)
