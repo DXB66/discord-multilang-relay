@@ -140,6 +140,12 @@ FULL_AI_BATCH_NUM_PREDICT = max(200, int(os.getenv("FULL_AI_BATCH_NUM_PREDICT", 
 FULL_AI_BATCH_TIMEOUT = max(5.0, float(os.getenv("FULL_AI_BATCH_TIMEOUT", "15")))
 FULL_AI_PER_TARGET_AFTER_BATCH_FAILURE = os.getenv("FULL_AI_PER_TARGET_AFTER_BATCH_FAILURE", "false").lower() in {"1", "true", "yes", "on"}
 
+# Webhook messages cannot reliably create Discord's native reply bubble while
+# also preserving the original user's name/avatar. Instead, mirrored replies can
+# include a small translated context line above the message.
+ENABLE_REPLY_CONTEXT = os.getenv("ENABLE_REPLY_CONTEXT", "true").lower() in {"1", "true", "yes", "on"}
+REPLY_CONTEXT_MAX_CHARS = max(40, int(os.getenv("REPLY_CONTEXT_MAX_CHARS", "180")))
+
 
 def make_app_emoji_name(original_name: str, emoji_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_]+", "_", original_name).strip("_") or "emoji"
@@ -881,6 +887,102 @@ def get_message_sticker_links(message: discord.Message) -> list[str]:
             links.append(f"https://media.discordapp.net/stickers/{sticker_id}.png?size=160")
 
     return links
+
+
+
+def compact_reply_context_text(text: str, max_chars: int = REPLY_CONTEXT_MAX_CHARS) -> str:
+    """Make a one-line reply preview that is short enough for Discord mirrors."""
+    compacted = " ".join((text or "").strip().split())
+    if not compacted:
+        return ""
+
+    if len(compacted) <= max_chars:
+        return compacted
+
+    return compacted[: max_chars - 1].rstrip() + "…"
+
+
+def get_message_reply_preview(message: discord.Message) -> str:
+    """Build a short preview for the message being replied to."""
+    content = compact_reply_context_text(message.content or "")
+    if content:
+        return content
+
+    if getattr(message, "stickers", None):
+        return "sticker"
+
+    if getattr(message, "attachments", None):
+        return "attachment"
+
+    return "message"
+
+
+async def get_reply_context_for_message(message: discord.Message) -> Optional[dict[str, str]]:
+    """Return author/text preview for a replied-to message, if any."""
+    if not ENABLE_REPLY_CONTEXT:
+        return None
+
+    reference = getattr(message, "reference", None)
+    if reference is None or getattr(reference, "message_id", None) is None:
+        return None
+
+    referenced = getattr(reference, "resolved", None)
+    if not isinstance(referenced, discord.Message):
+        channel_id = getattr(reference, "channel_id", None) or message.channel.id
+        channel = await resolve_text_channel(int(channel_id))
+        if channel is None:
+            return None
+
+        try:
+            referenced = await channel.fetch_message(int(reference.message_id))
+        except discord.NotFound:
+            return None
+        except Exception:
+            log.exception("Failed to fetch replied-to message %s for reply context", reference.message_id)
+            return None
+
+    author_name = getattr(referenced.author, "display_name", None) or getattr(referenced.author, "name", "Unknown")
+    author_name = compact_reply_context_text(str(author_name), 48)
+    preview = get_message_reply_preview(referenced)
+
+    if not preview:
+        return None
+
+    return {
+        "author": author_name,
+        "text": preview,
+    }
+
+
+async def build_reply_context_prefix(
+    reply_context: Optional[dict[str, str]],
+    source_lang: str,
+    target_lang: str,
+) -> str:
+    """Build a translated quote-style line for mirrored replies."""
+    if not reply_context:
+        return ""
+
+    author = reply_context.get("author") or "Unknown"
+    preview = reply_context.get("text") or ""
+    preview = compact_reply_context_text(preview)
+    if not preview:
+        return ""
+
+    translated_preview = preview
+    try:
+        translated_preview = await bot.translate_text(preview, source_lang, target_lang)
+    except Exception as exc:
+        # Reply context is nice-to-have. Never block the main relay because of it.
+        log.warning(
+            "Could not translate reply context from %s to %s. Using original preview. Error: %s",
+            source_lang,
+            target_lang,
+            exc,
+        )
+
+    translated_preview = compact_reply_context_text(translated_preview)
+    return f"> ↪ {author}: {translated_preview}\n\n"
 
 
 def split_text_for_limit(text: str, limit: int) -> list[str]:
@@ -3207,6 +3309,7 @@ async def relay_to_target(
     avatar_url: str,
     existing_message_ids: Optional[list[int]] = None,
     pretranslated_text: Optional[str] = None,
+    reply_context: Optional[dict[str, str]] = None,
 ) -> tuple[int, list[int]] | None:
     if message.guild is None:
         return None
@@ -3252,6 +3355,14 @@ async def relay_to_target(
         if final_content:
             final_content += "\n\n"
         final_content += "\n".join(attachment_links)
+
+    reply_prefix = await build_reply_context_prefix(
+        reply_context,
+        source_lang,
+        target["language_code"],
+    )
+    if reply_prefix:
+        final_content = f"{reply_prefix}{final_content}".strip()
 
     if not final_content:
         return None
@@ -3324,6 +3435,7 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
         attachment_links.extend(sticker_links)
     display_name = message.author.display_name
     avatar_url = message.author.display_avatar.url
+    reply_context = await get_reply_context_for_message(message)
 
     if ENFORCE_SOURCE_LANGUAGE and original_text.strip():
         try:
@@ -3398,6 +3510,7 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
                 avatar_url=avatar_url,
                 existing_message_ids=existing_records_by_target.get(target["channel_id"]),
                 pretranslated_text=pretranslated_by_channel.get(target["channel_id"]),
+                reply_context=reply_context,
             )
 
     results = await asyncio.gather(*(run_relay(target) for target in relay_targets), return_exceptions=True)
