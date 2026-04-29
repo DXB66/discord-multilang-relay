@@ -1014,8 +1014,11 @@ async def get_reply_context_for_message(message: discord.Message) -> Optional[di
     if not preview:
         return None
 
+    author_id = getattr(referenced.author, "id", None)
+
     return {
         "author": author_name,
+        "author_id": str(author_id) if author_id is not None else "",
         "text": preview,
     }
 
@@ -1030,6 +1033,7 @@ async def build_reply_context_prefix(
         return ""
 
     author = reply_context.get("author") or "Unknown"
+    author_id = (reply_context.get("author_id") or "").strip()
     preview = reply_context.get("text") or ""
     preview = compact_reply_context_text(preview)
     if not preview:
@@ -1048,7 +1052,12 @@ async def build_reply_context_prefix(
         )
 
     translated_preview = compact_reply_context_text(translated_preview)
-    return f"> ↪ {author}: {translated_preview}\n\n"
+
+    # Show a Discord-style user mention before the display name when possible.
+    # Webhook sends still use AllowedMentions.none(), so this is meant as a
+    # tag-style context label without causing notification spam.
+    author_label = f"<@{author_id}> {author}" if author_id.isdigit() else author
+    return f"> ↪ {author_label}: {translated_preview}\n\n"
 
 
 def split_text_for_limit(text: str, limit: int) -> list[str]:
@@ -2842,7 +2851,23 @@ class RelayBot(commands.Bot):
                     else:
                         translated_parts.append(before)
 
-                translated_parts.append(wrap_protected_token_for_target(match.group(0), target_norm))
+                token = match.group(0)
+
+                # Keep emoji-only lines clean so Discord can still render them
+                # as large/jumbo emojis in RTL target channels. Directional
+                # isolates are only needed when Unicode emojis are mixed inline
+                # with Arabic/RTL text; adding hidden marks to standalone emoji
+                # lines can make Discord render them as small inline emoji.
+                line_start = text.rfind("\n", 0, match.start()) + 1
+                line_end = text.find("\n", match.end())
+                if line_end == -1:
+                    line_end = len(text)
+                line_text = text[line_start:line_end].strip()
+
+                if re.fullmatch(UNICODE_EMOJI_PATTERN, token) and re.fullmatch(UNICODE_EMOJI_PATTERN, line_text):
+                    translated_parts.append(token)
+                else:
+                    translated_parts.append(wrap_protected_token_for_target(token, target_norm))
                 last_index = match.end()
 
             after = text[last_index:]
