@@ -82,6 +82,9 @@ COLON_EMOJI_PATTERN = r":[A-Za-z0-9_]{2,32}:"
 # Protect links/GIF URLs from translation. Translators can corrupt URLs by
 # adding spaces, translating slug words, or appending language names.
 URL_PATTERN = r"(?:https?://|www\.)[^\s<>()]+"
+# Protect Discord/chat hashtag-style numbers/tags like #295, #280, #event.
+# Translators can drop or move these if they are not kept as protected tokens.
+HASHTAG_TOKEN_PATTERN = r"(?<![A-Za-z0-9_])#[A-Za-z0-9_]{1,64}"
 
 DISCORD_PROTECTED_TOKEN_RE = re.compile(
     URL_PATTERN +
@@ -90,6 +93,7 @@ DISCORD_PROTECTED_TOKEN_RE = re.compile(
     r"|<@&\d{15,25}>"
     r"|<#\d{15,25}>"
     r"|<t:\d{1,12}(?::[tTdDfFR])?>"
+    r"|" + HASHTAG_TOKEN_PATTERN +
     r"|" + COLON_EMOJI_PATTERN +
     r"|" + UNICODE_EMOJI_PATTERN
 )
@@ -946,6 +950,77 @@ def looks_like_ai_explanation_output(text: str) -> bool:
         explanation_words = ("translation", "meaningful", "emoji", "emoticon", "text", "message")
         if sum(1 for word in explanation_words if word in lowered) >= 2:
             return True
+
+    return False
+
+
+# LibreTranslate/Argos can sometimes leak ASS/SSA subtitle styling tags into
+# Chinese output, e.g. {\fn黑體\fs22\bord1...}. These should never be shown in
+# Discord. Clean them before sending/caching.
+ASS_STYLE_TAG_RE = re.compile(r"\{\\[^{}]*\}")
+ASS_STYLE_COMMAND_RE = re.compile(r"\\(?:fn|fs|bord|shad|[1234]?a|fscx|fscy|[1234]?c)[A-Za-z0-9&]+", re.IGNORECASE)
+
+
+def extract_hashtag_tokens(text: str) -> list[str]:
+    return re.findall(HASHTAG_TOKEN_PATTERN, text or "")
+
+
+def missing_hashtag_tokens(source_text: str, translated_text: str) -> list[str]:
+    """Return source hashtag tokens that disappeared from a translation."""
+    source_tokens = extract_hashtag_tokens(source_text)
+    if not source_tokens:
+        return []
+
+    translated = translated_text or ""
+    missing: list[str] = []
+    for token in source_tokens:
+        if token not in translated and token not in missing:
+            missing.append(token)
+    return missing
+
+
+def clean_translation_engine_artifacts(text: str) -> str:
+    """Remove known garbage formatting leaked by local translation engines."""
+    if not text:
+        return text
+
+    cleaned = text
+
+    # Remove full ASS/SSA tags, including Chinese font names inside the tag.
+    cleaned = ASS_STYLE_TAG_RE.sub("", cleaned)
+
+    # If a broken tag was partially emitted without braces, strip common style
+    # commands while preserving normal translated words around them.
+    cleaned = ASS_STYLE_COMMAND_RE.sub("", cleaned)
+
+    # Normalize whitespace around lines after tag removal.
+    lines = []
+    for line in cleaned.splitlines():
+        line = re.sub(r"[ \t]{2,}", " ", line).strip()
+        lines.append(line)
+
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+def looks_like_translation_artifact_garbage(text: str) -> bool:
+    """Detect formatting/code garbage that should not be cached or sent."""
+    cleaned = text or ""
+    if not cleaned.strip():
+        return False
+
+    if ASS_STYLE_TAG_RE.search(cleaned):
+        return True
+
+    # ASS commands showing up in visible text are a strong sign of bad output.
+    command_hits = len(ASS_STYLE_COMMAND_RE.findall(cleaned))
+    if command_hits >= 2:
+        return True
+
+    # Guard against repeated raw formatting braces/backslashes.
+    if cleaned.count("\\") >= 4 and ("{" in cleaned or "}" in cleaned):
+        return True
 
     return False
 
@@ -2238,7 +2313,22 @@ class RelayBot(commands.Bot):
         target_lang: str,
         translated_text: str,
     ) -> str:
-        normalized = normalize_translated_output_for_target(translated_text, target_lang)
+        cleaned = clean_translation_engine_artifacts(translated_text)
+        normalized = normalize_translated_output_for_target(cleaned, target_lang)
+
+        missing_hashes = missing_hashtag_tokens(original_text, normalized)
+        if missing_hashes:
+            # This should be rare now because hashtag tokens are protected before
+            # translation. If an engine still drops them, append them rather than
+            # losing important game/state numbers like #295 or #280.
+            normalized = f"{normalized} {' '.join(missing_hashes)}".strip()
+            log.warning(
+                "Translation output was missing protected hashtag token(s) for %s -> %s; restored: %s",
+                canonical_language_code(source_lang),
+                canonical_language_code(target_lang),
+                ", ".join(missing_hashes),
+            )
+
         await self.set_cached_translation(original_text, source_lang, target_lang, normalized)
         return normalized
 
@@ -2939,15 +3029,32 @@ class RelayBot(commands.Bot):
 
         cached_translation = await self.get_cached_translation(text, source_norm, target_norm)
         if cached_translation is not None:
+            missing_hashes = missing_hashtag_tokens(text, cached_translation)
             if looks_like_ai_explanation_output(cached_translation):
                 log.warning(
                     "Ignoring cached AI explanation output for %s -> %s.",
                     source_norm,
                     target_norm,
                 )
+            elif looks_like_translation_artifact_garbage(cached_translation):
+                log.warning(
+                    "Ignoring cached translation artifact output for %s -> %s.",
+                    source_norm,
+                    target_norm,
+                )
+            elif missing_hashes:
+                log.warning(
+                    "Ignoring cached translation that dropped protected hashtag token(s) for %s -> %s: %s",
+                    source_norm,
+                    target_norm,
+                    ", ".join(missing_hashes),
+                )
             else:
                 log_translation_route("persistent-cache", source_norm, target_norm, text)
-                return normalize_translated_output_for_target(cached_translation, target_norm)
+                return normalize_translated_output_for_target(
+                    clean_translation_engine_artifacts(cached_translation),
+                    target_norm,
+                )
 
         common_translation = get_common_phrase_translation(text, source_norm, target_norm)
         if common_translation is not None:
