@@ -921,6 +921,41 @@ def get_message_sticker_links(message: discord.Message) -> list[str]:
 
 
 
+async def get_webhook_author_identity(message: discord.Message) -> tuple[str, str]:
+    """Return the display name/avatar that webhook mirrors should use.
+
+    Prefer the server member profile when available. Fetched messages from raw
+    edit events can sometimes expose the author more like a global user, which
+    can make edited mirrors switch from server nickname/avatar to global
+    profile. This keeps relay and edit-sync consistent.
+    """
+    author = message.author
+    member: Optional[discord.Member] = author if isinstance(author, discord.Member) else None
+
+    if message.guild is not None and member is None:
+        member = message.guild.get_member(author.id)
+        if member is None:
+            try:
+                member = await message.guild.fetch_member(author.id)
+            except (discord.NotFound, discord.Forbidden):
+                member = None
+            except Exception:
+                log.exception("Failed to fetch guild member %s for webhook identity", author.id)
+                member = None
+
+    identity = member or author
+    display_name = (
+        getattr(identity, "display_name", None)
+        or getattr(author, "display_name", None)
+        or getattr(author, "name", "Unknown")
+    )
+
+    avatar = getattr(identity, "display_avatar", None) or getattr(author, "display_avatar", None)
+    avatar_url = avatar.url if avatar is not None else author.default_avatar.url
+
+    return str(display_name), str(avatar_url)
+
+
 def compact_reply_context_text(text: str, max_chars: int = REPLY_CONTEXT_MAX_CHARS) -> str:
     """Make a one-line reply preview that is short enough for Discord mirrors."""
     compacted = " ".join((text or "").strip().split())
@@ -1174,6 +1209,37 @@ class RelayBot(commands.Bot):
         self.full_ai_cache: dict[tuple[str, str, str], str] = {}
         self.full_ai_batch_cache: dict[tuple[str, tuple[str, ...], str], dict[str, str]] = {}
         self.full_ai_batch_failed_messages: set[tuple[str, str]] = set()
+        self.source_message_locks: dict[tuple[int, int, int], asyncio.Lock] = {}
+        self.source_message_locks_guard = asyncio.Lock()
+
+    async def get_source_message_lock(self, guild_id: int, channel_id: int, message_id: int) -> asyncio.Lock:
+        """Return a per-source-message lock to prevent send/edit relay races.
+
+        If a user edits a message while the initial mirror is still being sent,
+        Discord can deliver the edit event before relay records are saved. The
+        lock makes edit-sync wait for the initial relay, so it updates existing
+        mirrored messages instead of creating duplicate mirrors.
+        """
+        key = (int(guild_id), int(channel_id), int(message_id))
+        async with self.source_message_locks_guard:
+            lock = self.source_message_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self.source_message_locks[key] = lock
+
+            # Lightweight cleanup so the lock map does not grow forever.
+            if len(self.source_message_locks) > 10000:
+                removed = 0
+                for old_key, old_lock in list(self.source_message_locks.items()):
+                    if old_key == key:
+                        continue
+                    if not old_lock.locked():
+                        self.source_message_locks.pop(old_key, None)
+                        removed += 1
+                    if removed >= 2000:
+                        break
+
+            return lock
 
     async def setup_hook(self) -> None:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -3549,8 +3615,7 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
     sticker_links = get_message_sticker_links(message)
     if sticker_links:
         attachment_links.extend(sticker_links)
-    display_name = message.author.display_name
-    avatar_url = message.author.display_avatar.url
+    display_name, avatar_url = await get_webhook_author_identity(message)
     reply_context = await get_reply_context_for_message(message)
 
     if ENFORCE_SOURCE_LANGUAGE and original_text.strip():
@@ -3849,14 +3914,16 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
     if message.author.bot or message.webhook_id is not None:
         return
 
-    existing_rows = await bot.get_relay_records_for_source(payload.guild_id, payload.channel_id, payload.message_id)
-    existing_records_by_target = group_relay_rows_by_target(existing_rows)
+    lock = await bot.get_source_message_lock(payload.guild_id, payload.channel_id, payload.message_id)
+    async with lock:
+        existing_rows = await bot.get_relay_records_for_source(payload.guild_id, payload.channel_id, payload.message_id)
+        existing_records_by_target = group_relay_rows_by_target(existing_rows)
 
-    if not message.content and not message.attachments and not getattr(message, "stickers", None):
-        await delete_mirrored_messages(payload.guild_id, payload.channel_id, payload.message_id)
-        return
+        if not message.content and not message.attachments and not getattr(message, "stickers", None):
+            await delete_mirrored_messages(payload.guild_id, payload.channel_id, payload.message_id)
+            return
 
-    await sync_linked_message(message, existing_records_by_target)
+        await sync_linked_message(message, existing_records_by_target)
 
 
 @bot.event
@@ -3873,7 +3940,10 @@ async def on_message(message: discord.Message) -> None:
     if not message.content and not message.attachments and not getattr(message, "stickers", None):
         return
 
-    await sync_linked_message(message)
+    lock = await bot.get_source_message_lock(message.guild.id, message.channel.id, message.id)
+    async with lock:
+        await sync_linked_message(message)
+
     await bot.process_commands(message)
 
 
