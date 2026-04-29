@@ -853,6 +853,104 @@ def get_short_phrase_override(text: str, target_lang: str) -> Optional[str]:
 
 
 
+KOREAN_EMOTICON_LINE_RE = re.compile(
+    r"^(?P<prefix>\s*)(?P<body>[ㅠㅜㅋㅎ]+)(?P<punct>[.!?~。！？…]*)\s*$"
+)
+
+
+def get_korean_emoticon_override(text: str, source_lang: str, target_lang: str) -> Optional[str]:
+    """Convert Korean chat emoticons like ㅠㅠ before AI translation.
+
+    Aya/Ollama can sometimes explain that these are emoticons instead of
+    returning a clean Discord-friendly result. These are universal enough to
+    mirror as emoji across all target languages.
+    """
+    source_base = canonical_language_code(source_lang).split("-", 1)[0]
+    target_base = canonical_language_code(target_lang).split("-", 1)[0]
+
+    if source_base != "ko" or target_base == "ko":
+        return None
+
+    if len(text.strip()) > 40:
+        return None
+
+    output_lines: list[str] = []
+    saw_override = False
+
+    for raw_line in text.splitlines() or [text]:
+        if not raw_line.strip():
+            output_lines.append(raw_line)
+            continue
+
+        match = KOREAN_EMOTICON_LINE_RE.fullmatch(raw_line)
+        if not match:
+            return None
+
+        body = match.group("body") or ""
+        punct = match.group("punct") or ""
+        prefix = match.group("prefix") or ""
+
+        if body and all(ch in {"ㅠ", "ㅜ"} for ch in body):
+            output_lines.append(f"{prefix}😭{punct}")
+            saw_override = True
+            continue
+
+        if body and all(ch == "ㅋ" for ch in body):
+            output_lines.append(f"{prefix}😂{punct}")
+            saw_override = True
+            continue
+
+        if body and all(ch == "ㅎ" for ch in body):
+            output_lines.append(f"{prefix}😄{punct}")
+            saw_override = True
+            continue
+
+        return None
+
+    if not saw_override:
+        return None
+
+    return "\n".join(output_lines)
+
+
+AI_EXPLANATION_MARKERS = (
+    "no translation needed",
+    "not a meaningful",
+    "not meaningful",
+    "rather an emoji",
+    "rather an emoticon",
+    "not a korean text",
+    "not korean text",
+    "cannot be translated",
+    "can't be translated",
+    "does not need translation",
+    "doesn't need translation",
+    "is an emoji",
+    "is an emoticon",
+)
+
+
+def looks_like_ai_explanation_output(text: str) -> bool:
+    """Detect AI commentary that should never be mirrored into Discord."""
+    cleaned = " ".join((text or "").strip().split())
+    if not cleaned:
+        return False
+
+    lowered = cleaned.lower()
+
+    if any(marker in lowered for marker in AI_EXPLANATION_MARKERS):
+        return True
+
+    # Extra guard for parenthesized AI explanations.
+    if cleaned.startswith("(") and cleaned.endswith(")") and len(cleaned) < 240:
+        explanation_words = ("translation", "meaningful", "emoji", "emoticon", "text", "message")
+        if sum(1 for word in explanation_words if word in lowered) >= 2:
+            return True
+
+    return False
+
+
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Add it in your .env or environment variables.")
 
@@ -2366,6 +2464,14 @@ class RelayBot(commands.Bot):
                     if not translated:
                         raise RuntimeError("Ollama Korean AI returned an empty translation.")
 
+                    if looks_like_ai_explanation_output(translated):
+                        log.warning(
+                            "Korean AI helper returned explanation-like output for %s -> %s; ignoring it.",
+                            source_base,
+                            cache_target,
+                        )
+                        return None
+
                     if len(self.korean_ai_cache) > 256:
                         self.korean_ai_cache.clear()
                     self.korean_ai_cache[cache_key] = translated
@@ -2821,10 +2927,27 @@ class RelayBot(commands.Bot):
             log_translation_route("same-language", source_norm, target_norm, text)
             return text
 
+        korean_emoticon_override = get_korean_emoticon_override(text, source_norm, target_norm)
+        if korean_emoticon_override is not None:
+            log_translation_route("korean-emoticon", source_norm, target_norm, text)
+            return await self.remember_translation_result(
+                text,
+                source_norm,
+                target_norm,
+                korean_emoticon_override,
+            )
+
         cached_translation = await self.get_cached_translation(text, source_norm, target_norm)
         if cached_translation is not None:
-            log_translation_route("persistent-cache", source_norm, target_norm, text)
-            return normalize_translated_output_for_target(cached_translation, target_norm)
+            if looks_like_ai_explanation_output(cached_translation):
+                log.warning(
+                    "Ignoring cached AI explanation output for %s -> %s.",
+                    source_norm,
+                    target_norm,
+                )
+            else:
+                log_translation_route("persistent-cache", source_norm, target_norm, text)
+                return normalize_translated_output_for_target(cached_translation, target_norm)
 
         common_translation = get_common_phrase_translation(text, source_norm, target_norm)
         if common_translation is not None:
