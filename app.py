@@ -615,6 +615,17 @@ def get_common_phrase_translation(text: str, source_lang: str, target_lang: str)
 # phrases first, then the bot translates that pivot to the target language.
 ARABIC_LETTER_RE = re.compile(r"[\u0600-\u06FF]")
 KOREAN_LETTER_RE = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
+LATIN_LETTER_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿĀ-ſ]")
+MEANINGFUL_TEXT_LETTER_RE = re.compile(
+    r"[A-Za-zÀ-ÖØ-öø-ÿĀ-ſ]"
+    r"|[\u0400-\u04FF]"
+    r"|[\u0600-\u06FF]"
+    r"|[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]"
+    r"|[\u3040-\u30FF]"
+    r"|[\u4E00-\u9FFF]"
+)
+MIXED_LANGUAGE_AUTO_DETECT = os.getenv("MIXED_LANGUAGE_AUTO_DETECT", "true").lower() in {"1", "true", "yes", "on"}
+MIXED_LANGUAGE_MIN_CHARS = max(12, int(os.getenv("MIXED_LANGUAGE_MIN_CHARS", "18")))
 ARABIC_DIACRITICS_RE = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
 ARABIC_LINE_RE = re.compile(r"^(?P<prefix>\s*)(?P<body>.*?)(?P<punct>[.!?؟،,…]*)\s*$", re.DOTALL)
 
@@ -987,11 +998,24 @@ def clean_translation_engine_artifacts(text: str) -> str:
     cleaned = text
 
     # Remove full ASS/SSA tags, including Chinese font names inside the tag.
-    cleaned = ASS_STYLE_TAG_RE.sub("", cleaned)
+    # Some engines emit tags such as:
+    # {\fn黑體\fs22\bord1\shad0\3ahbe\4ah00\fscx67\fscy66...}
+    cleaned = re.sub(r"\{\\[^{}]*\}", "", cleaned)
+    cleaned = re.sub(r"\{(?:\\[^{}\\]*){2,}[^{}]*\}", "", cleaned)
 
     # If a broken tag was partially emitted without braces, strip common style
     # commands while preserving normal translated words around them.
     cleaned = ASS_STYLE_COMMAND_RE.sub("", cleaned)
+    cleaned = re.sub(
+        r"\\(?:fn|fs|bord|shad|[1234]?a|fscx|fscy|[1234]?c)[^\s{}，。,.!?؛:;]+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove empty braces or leftover tag fragments.
+    cleaned = cleaned.replace("{}", "")
+    cleaned = re.sub(r"\{+\s*\}+", "", cleaned)
 
     # Normalize whitespace around lines after tag removal.
     lines = []
@@ -1003,23 +1027,137 @@ def clean_translation_engine_artifacts(text: str) -> str:
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
 
-
 def looks_like_translation_artifact_garbage(text: str) -> bool:
     """Detect formatting/code garbage that should not be cached or sent."""
     cleaned = text or ""
     if not cleaned.strip():
         return False
 
-    if ASS_STYLE_TAG_RE.search(cleaned):
+    if re.search(r"\{\\[^{}]*\}", cleaned):
         return True
 
     # ASS commands showing up in visible text are a strong sign of bad output.
     command_hits = len(ASS_STYLE_COMMAND_RE.findall(cleaned))
-    if command_hits >= 2:
+    extra_command_hits = len(re.findall(
+        r"\\(?:fn|fs|bord|shad|[1234]?a|fscx|fscy|[1234]?c)",
+        cleaned,
+        flags=re.IGNORECASE,
+    ))
+    if command_hits + extra_command_hits >= 2:
         return True
 
     # Guard against repeated raw formatting braces/backslashes.
-    if cleaned.count("\\") >= 4 and ("{" in cleaned or "}" in cleaned):
+    if cleaned.count("\\") >= 3 and ("{" in cleaned or "}" in cleaned):
+        return True
+
+    return False
+
+
+
+def is_non_language_passthrough_text(text: str) -> bool:
+    """Return True for signs/separators/IDs that should be mirrored unchanged.
+
+    Examples: "---", "_", "____", "...", "#295 #280", emoji-only lines.
+    These are not real language content, so translation engines should not touch
+    them.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+
+    # Remove protected Discord tokens first. A line that is only emojis,
+    # hashtags, mentions, URLs, etc. should be copied as-is.
+    without_tokens = DISCORD_PROTECTED_TOKEN_RE.sub("", cleaned).strip()
+    if not without_tokens:
+        return True
+
+    # If there are no meaningful text letters at all, it is just punctuation,
+    # numbers, separators, or symbols.
+    return MEANINGFUL_TEXT_LETTER_RE.search(without_tokens) is None
+
+
+def split_preserving_line_endings(text: str) -> list[tuple[str, str]]:
+    """Split text into (line_without_newline, newline_suffix) pairs."""
+    if text == "":
+        return [("", "")]
+
+    parts: list[tuple[str, str]] = []
+    for raw in text.splitlines(keepends=True):
+        if raw.endswith("\r\n"):
+            parts.append((raw[:-2], "\r\n"))
+        elif raw.endswith("\n") or raw.endswith("\r"):
+            parts.append((raw[:-1], raw[-1:]))
+        else:
+            parts.append((raw, ""))
+
+    return parts
+
+
+COMMON_SPANISH_WORD_RE = re.compile(
+    r"\b("
+    r"a|al|algo|algunos|amigos|como|con|de|del|dejar|el|en|es|esa|ese|estado|"
+    r"están|estan|fueron|la|las|lo|los|meses|no|nosotros|personas|por|porque|"
+    r"puede|que|son|uno|veces|ver|viejos|vuelvo|y"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_spanish_latin_text(text: str) -> bool:
+    """Lightweight guard for Spanish pasted into another Latin channel."""
+    cleaned = " ".join((text or "").strip().split())
+    if len(cleaned) < MIXED_LANGUAGE_MIN_CHARS:
+        return False
+
+    if not LATIN_LETTER_RE.search(cleaned):
+        return False
+
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿĀ-ſ']+", cleaned)
+    if len(words) < 3:
+        return False
+
+    spanish_hits = len(COMMON_SPANISH_WORD_RE.findall(cleaned))
+    accented_spanish = bool(re.search(r"[áéíóúñ¿¡]", cleaned, flags=re.IGNORECASE))
+
+    # Require a few Spanish function words, or accented Spanish punctuation.
+    return spanish_hits >= 3 or (accented_spanish and spanish_hits >= 1)
+
+
+def should_try_mixed_language_detection(text: str, source_lang: str) -> bool:
+    """Avoid expensive detection unless the line could be the wrong Latin language."""
+    if not MIXED_LANGUAGE_AUTO_DETECT:
+        return False
+
+    cleaned = (text or "").strip()
+    if len(cleaned) < MIXED_LANGUAGE_MIN_CHARS:
+        return False
+
+    source_base = canonical_language_code(source_lang).split("-", 1)[0]
+    if source_base not in {"en", "es", "pt", "fr", "de", "it", "nl", "pl", "tr"}:
+        return False
+
+    if is_non_language_passthrough_text(cleaned):
+        return False
+
+    # We only auto-detect Latin text here. Arabic/Korean/script mismatches are
+    # handled above with script-specific checks.
+    return bool(LATIN_LETTER_RE.search(cleaned))
+
+
+def should_translate_line_by_line(text: str) -> bool:
+    """Return True when per-line translation can preserve separators/mixed languages."""
+    if "\n" not in text:
+        return False
+
+    lines = split_preserving_line_endings(text)
+    non_empty = [line for line, _nl in lines if line.strip()]
+    if len(non_empty) <= 1:
+        return False
+
+    if any(is_non_language_passthrough_text(line) for line in non_empty):
+        return True
+
+    if any(looks_like_spanish_latin_text(line) for line in non_empty):
         return True
 
     return False
@@ -1394,6 +1532,7 @@ class RelayBot(commands.Bot):
         self.full_ai_batch_failed_messages: set[tuple[str, str]] = set()
         self.source_message_locks: dict[tuple[int, int, int], asyncio.Lock] = {}
         self.source_message_locks_guard = asyncio.Lock()
+        self.language_detect_cache: dict[str, str] = {}
 
     async def get_source_message_lock(self, guild_id: int, channel_id: int, message_id: int) -> asyncio.Lock:
         """Return a per-source-message lock to prevent send/edit relay races.
@@ -2258,8 +2397,12 @@ class RelayBot(commands.Bot):
         if not should_use_persistent_translation_cache(text):
             return
 
-        cleaned_translation = translated_text.strip()
+        cleaned_translation = clean_translation_engine_artifacts(translated_text).strip()
         if not cleaned_translation:
+            return
+
+        if looks_like_translation_artifact_garbage(cleaned_translation):
+            log.warning("Skipped caching translation artifact output for %s -> %s.", source_lang, target_lang)
             return
 
         assert self.db is not None
@@ -2993,12 +3136,132 @@ class RelayBot(commands.Bot):
         )
         await self.db.commit()
 
+    async def detect_language_cached(self, text: str) -> Optional[str]:
+        """Detect language with a small in-memory cache to avoid repeated calls."""
+        cleaned = " ".join((text or "").strip().split())
+        if len(cleaned) < DETECT_MIN_TEXT_LENGTH:
+            return None
+
+        cache_key = cleaned[:500].lower()
+        cached = self.language_detect_cache.get(cache_key)
+        if cached:
+            return cached
+
+        detected = await self.detect_language(cleaned)
+        if detected:
+            self.language_detect_cache[cache_key] = detected
+
+            if len(self.language_detect_cache) > 2000:
+                for old_key in list(self.language_detect_cache.keys())[:500]:
+                    self.language_detect_cache.pop(old_key, None)
+
+        return detected
+
+    async def infer_effective_source_language(self, text: str, source_norm: str) -> str:
+        """Detect wrong-language Latin lines posted in a linked channel.
+
+        Example: a Spanish line in the English channel should be translated as
+        Spanish, not forced through English.
+        """
+        source_norm = canonical_language_code(source_norm)
+        cleaned = (text or "").strip()
+
+        if not cleaned or is_non_language_passthrough_text(cleaned):
+            return source_norm
+
+        # Script-based overrides for single lines.
+        if ARABIC_LETTER_RE.search(cleaned) and source_norm.split("-", 1)[0] != "ar":
+            return "ar"
+
+        if KOREAN_LETTER_RE.search(cleaned) and source_norm.split("-", 1)[0] != "ko":
+            return "ko"
+
+        # Fast explicit Spanish guard for common pasted Spanish lines. This fixes
+        # cases where a user writes Spanish in the English channel.
+        if looks_like_spanish_latin_text(cleaned) and source_norm.split("-", 1)[0] != "es":
+            return "es"
+
+        if not should_try_mixed_language_detection(cleaned, source_norm):
+            return source_norm
+
+        try:
+            detected = await self.detect_language_cached(cleaned)
+        except Exception as exc:
+            log.debug("Mixed-language line detection failed. Keeping source %s. Error: %s", source_norm, exc)
+            return source_norm
+
+        if not detected:
+            return source_norm
+
+        detected_norm = canonical_language_code(detected)
+        if language_matches(source_norm, detected_norm):
+            return source_norm
+
+        # Only auto-switch between Latin languages here. Different-script cases
+        # are handled above.
+        source_script = script_bucket_for_language(source_norm)
+        detected_script = script_bucket_for_language(detected_norm)
+        if source_script == detected_script == "latin":
+            return detected_norm
+
+        return source_norm
+
+    async def translate_mixed_language_lines_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
+        """Translate multi-line messages line-by-line when needed.
+
+        This keeps separator/sign lines unchanged and fixes mixed-language
+        messages where one line is Spanish inside an English channel, etc.
+        """
+        if not should_translate_line_by_line(text):
+            return None
+
+        output: list[str] = []
+        changed_route = False
+
+        for line, newline in split_preserving_line_endings(text):
+            if not line.strip():
+                output.append(line + newline)
+                continue
+
+            if is_non_language_passthrough_text(line):
+                output.append(line + newline)
+                changed_route = True
+                continue
+
+            effective_source = await self.infer_effective_source_language(line, source_norm)
+            if effective_source != source_norm:
+                changed_route = True
+
+            translated_line = await self.translate_text(line, effective_source, target_norm)
+            output.append(translated_line + newline)
+
+        if not changed_route:
+            return None
+
+        translated = "".join(output)
+        log_translation_route("mixed-line", source_norm, target_norm, text)
+        return normalize_translated_output_for_target(clean_translation_engine_artifacts(translated), target_norm)
+
     async def translate_text(self, text: str, source_lang: str, target_lang: str) -> str:
         if not text.strip():
             return text
 
         source_norm = canonical_language_code(source_lang)
         target_norm = canonical_language_code(target_lang)
+
+        if is_non_language_passthrough_text(text):
+            log_translation_route("non-language-passthrough", source_norm, target_norm, text)
+            return text
+
+        mixed_line_translation = await self.translate_mixed_language_lines_if_needed(text, source_norm, target_norm)
+        if mixed_line_translation is not None:
+            return await self.remember_translation_result(text, source_norm, target_norm, mixed_line_translation)
+
+        inferred_source = await self.infer_effective_source_language(text, source_norm)
+        if inferred_source != source_norm:
+            log_translation_route("mixed-source-detected", source_norm, target_norm, text, detail=f"detected_source={inferred_source}")
+            source_norm = inferred_source
+            source_lang = inferred_source
 
         # If someone writes Arabic text in the "wrong" linked channel, do not
         # force LibreTranslate to treat that Arabic as the channel language
@@ -3801,6 +4064,8 @@ async def relay_to_target(
     )
     if reply_prefix:
         final_content = f"{reply_prefix}{final_content}".strip()
+
+    final_content = clean_translation_engine_artifacts(final_content).strip()
 
     if not final_content:
         return None
