@@ -1053,10 +1053,11 @@ async def build_reply_context_prefix(
 
     translated_preview = compact_reply_context_text(translated_preview)
 
-    # Show a Discord-style user mention before the display name when possible.
+    # Show a Discord-style user mention when possible.
     # Webhook sends still use AllowedMentions.none(), so this is meant as a
-    # tag-style context label without causing notification spam.
-    author_label = f"<@{author_id}> {author}" if author_id.isdigit() else author
+    # tag-style context label without causing notification spam. If a real
+    # mention is available, do not repeat the display name after it.
+    author_label = f"<@{author_id}>" if author_id.isdigit() else author
     return f"> ↪ {author_label}: {translated_preview}\n\n"
 
 
