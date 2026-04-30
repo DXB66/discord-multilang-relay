@@ -179,14 +179,20 @@ def is_rtl_language_code(code: str) -> bool:
 
 
 def should_direction_wrap_token(token: str) -> bool:
-    # Only wrap normal Unicode emoji clusters for RTL targets.
+    # Wrap normal Unicode emoji clusters and hashtag tokens for RTL targets.
     #
     # Discord custom/app emojis like <:name:id> should NOT be wrapped with
     # invisible direction marks. Those hidden marks can make Discord render
     # emoji-only custom emoji messages as small inline emojis in Arabic channels.
     # Custom emojis are parsed by Discord before display, so they do not need
     # LTR isolate wrapping.
-    return re.fullmatch(UNICODE_EMOJI_PATTERN, token) is not None
+    #
+    # Hashtag/game-state tokens such as #295 and #280 should be wrapped in RTL
+    # languages so they keep their left-to-right visual order.
+    return (
+        re.fullmatch(UNICODE_EMOJI_PATTERN, token) is not None
+        or re.fullmatch(HASHTAG_TOKEN_PATTERN, token) is not None
+    )
 
 
 def wrap_protected_token_for_target(token: str, target_lang: str) -> str:
@@ -200,17 +206,41 @@ def wrap_protected_token_for_target(token: str, target_lang: str) -> str:
     return f"{LTR_ISOLATE}{token}{POP_DIRECTIONAL_ISOLATE}"
 
 
+def normalize_hashtag_spacing(text: str) -> str:
+    """Keep protected hashtag tokens readable after translation.
+
+    Translators often glue protected placeholders back to punctuation, e.g.
+    "us?#295". Add a space before visible or LTR-isolated hashtags without
+    touching URL fragments like example.com/page#section.
+    """
+    if not text:
+        return text
+
+    # Visible hashtags: "text?#295" -> "text? #295"
+    text = re.sub(r"(?<=[^\sA-Za-z0-9_/\\])(?=#[A-Za-z0-9_]{1,64}\b)", " ", text)
+
+    # RTL wrapped hashtags: "معنا؟\u2066#295\u2069" -> "معنا؟ \u2066#295\u2069"
+    text = re.sub(
+        rf"(?<=[^\sA-Za-z0-9_/\\])(?={re.escape(LTR_ISOLATE)}#[A-Za-z0-9_]{{1,64}}{re.escape(POP_DIRECTIONAL_ISOLATE)})",
+        " ",
+        text,
+    )
+
+    return text
+
+
 def normalize_translated_output_for_target(text: str, target_lang: str) -> str:
+    text = normalize_hashtag_spacing(text)
+
     # LibreTranslate sometimes returns duplicated punctuation for Arabic, e.g.
     # "??" or "؟؟" after a translated question. Collapse those to one Arabic
     # question mark without touching normal text.
-    if canonical_language_code(target_lang).split("-", 1)[0] != "ar":
-        return text
+    if canonical_language_code(target_lang).split("-", 1)[0] == "ar":
+        # Only collapse repeated question punctuation. This avoids changing normal
+        # protected links that may contain a single ? in the URL query string.
+        text = re.sub(r"[؟?]{2,}", "؟", text)
 
-    # Only collapse repeated question punctuation. This avoids changing normal
-    # protected links that may contain a single ? in the URL query string.
-    text = re.sub(r"[؟?]{2,}", "؟", text)
-    return text
+    return normalize_hashtag_spacing(text)
 
 
 CHAT_SLANG_REPLACEMENTS: dict[str, str] = {
@@ -1065,6 +1095,9 @@ def is_non_language_passthrough_text(text: str) -> bool:
     if not cleaned:
         return False
 
+    if is_expressive_chat_reaction(cleaned):
+        return True
+
     # Remove protected Discord tokens first. A line that is only emojis,
     # hashtags, mentions, URLs, etc. should be copied as-is.
     without_tokens = DISCORD_PROTECTED_TOKEN_RE.sub("", cleaned).strip()
@@ -1103,9 +1136,78 @@ COMMON_SPANISH_WORD_RE = re.compile(
 )
 
 
+def normalize_spanish_chat_phrase_key(text: str) -> str:
+    cleaned = (text or "").strip().lower()
+    cleaned = cleaned.strip("¿¡")
+    cleaned = re.sub(r"[.!?¿¡…~،。！？]+$", "", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    # Small accent normalization for common Spanish chat phrases.
+    cleaned = (
+        cleaned.replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+        .replace("ñ", "n")
+    )
+    return cleaned
+
+
+SPANISH_CHAT_PHRASE_PIVOTS: dict[str, str] = {
+    "que tierno": "how cute",
+    "que lindo": "how cute",
+    "que bonito": "how nice",
+    "que dulce": "how sweet",
+    "a veces uno no puede dejar de ver a los viejos amigos": "sometimes you cannot stop seeing old friends",
+}
+
+
+def get_spanish_chat_phrase_pivot(text: str) -> Optional[str]:
+    """Return an English pivot for short/common Spanish chat phrases."""
+    match = SHORT_PHRASE_RE.match(text)
+    if not match:
+        return None
+
+    prefix = match.group("prefix") or ""
+    body = (match.group("body") or "").strip()
+    punct = match.group("punct") or ""
+
+    key = normalize_spanish_chat_phrase_key(body)
+    pivot = SPANISH_CHAT_PHRASE_PIVOTS.get(key)
+    if pivot is None:
+        return None
+
+    return f"{prefix}{pivot}{punct}"
+
+
+def is_spanish_chat_phrase(text: str) -> bool:
+    return get_spanish_chat_phrase_pivot(text) is not None
+
+
+EXPRESSIVE_CHAT_REACTION_RE = re.compile(
+    r"^\s*(?:a+w+|aw+|x+d+|x+|xd+)(?:[.!?…~]*)\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_expressive_chat_reaction(text: str) -> bool:
+    """Return True for expressive reaction sounds that are safer copied as-is.
+
+    Examples: "aaawww....", "awww", "XD". These are not worth sending through
+    translation engines, which can turn them into random words in some targets.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    return EXPRESSIVE_CHAT_REACTION_RE.fullmatch(cleaned) is not None
+
+
 def looks_like_spanish_latin_text(text: str) -> bool:
     """Lightweight guard for Spanish pasted into another Latin channel."""
     cleaned = " ".join((text or "").strip().split())
+    if is_spanish_chat_phrase(cleaned):
+        return True
+
     if len(cleaned) < MIXED_LANGUAGE_MIN_CHARS:
         return False
 
@@ -2642,11 +2744,13 @@ class RelayBot(commands.Bot):
             )
             cache_target = "en"
         else:
+            source_language_name = language_display_name(source_norm)
             target_language_name = "natural Korean"
             prompt_task = (
-                "Translate the Discord chat message into natural Korean. "
-                "Preserve line breaks, names, mentions, links, numbers, and emoji text. "
+                f"Translate the {source_language_name} Discord chat message into natural Korean. "
+                "Preserve line breaks, names, mentions, links, hashtags, numbers, and emoji text. "
                 "Use casual but clear Korean suitable for Discord chat. "
+                "Do not leave source-language words untranslated unless they are names, links, mentions, or protected tokens. "
                 "Return only the Korean translation with no explanation."
             )
             cache_target = "ko"
@@ -3279,6 +3383,14 @@ class RelayBot(commands.Bot):
         if source_norm == target_norm:
             log_translation_route("same-language", source_norm, target_norm, text)
             return text
+
+        spanish_chat_pivot = get_spanish_chat_phrase_pivot(text) if source_norm.split("-", 1)[0] == "es" else None
+        if spanish_chat_pivot is not None:
+            log_translation_route("spanish-chat-phrase", source_norm, target_norm, text)
+            if target_norm.split("-", 1)[0] == "en":
+                return await self.remember_translation_result(text, source_norm, target_norm, spanish_chat_pivot)
+            translated_from_pivot = await self.translate_text(spanish_chat_pivot, "en", target_norm)
+            return await self.remember_translation_result(text, source_norm, target_norm, translated_from_pivot)
 
         korean_emoticon_override = get_korean_emoticon_override(text, source_norm, target_norm)
         if korean_emoticon_override is not None:
