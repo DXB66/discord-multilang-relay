@@ -45,6 +45,15 @@ ENABLE_RELAY_RECORD_CLEANUP = os.getenv("ENABLE_RELAY_RECORD_CLEANUP", "true").l
 RELAY_RECORD_RETENTION_DAYS = max(1, int(os.getenv("RELAY_RECORD_RETENTION_DAYS", "30")))
 RELAY_RECORD_CLEANUP_INTERVAL_HOURS = max(1.0, float(os.getenv("RELAY_RECORD_CLEANUP_INTERVAL_HOURS", "24")))
 
+# Recovery cleanup for missed delete events. If the bot is restarted/offline
+# while a user deletes an original message, Discord will not replay that delete
+# event later. This checker finds recent relay records whose original message no
+# longer exists and deletes the mirrored webhook messages too.
+ENABLE_ORPHAN_RELAY_CLEANUP = os.getenv("ENABLE_ORPHAN_RELAY_CLEANUP", "true").lower() in {"1", "true", "yes", "on"}
+ORPHAN_RELAY_CLEANUP_INTERVAL_HOURS = max(0.25, float(os.getenv("ORPHAN_RELAY_CLEANUP_INTERVAL_HOURS", "1")))
+ORPHAN_RELAY_CLEANUP_BATCH_SIZE = max(10, int(os.getenv("ORPHAN_RELAY_CLEANUP_BATCH_SIZE", "75")))
+ORPHAN_RELAY_CLEANUP_GRACE_MINUTES = max(1, int(os.getenv("ORPHAN_RELAY_CLEANUP_GRACE_MINUTES", "5")))
+
 # Persistent translation cache. This survives bot restarts and makes repeated
 # phrases/messages faster, especially for AI-assisted Arabic/Korean translations.
 ENABLE_TRANSLATION_CACHE = os.getenv("ENABLE_TRANSLATION_CACHE", "true").lower() in {"1", "true", "yes", "on"}
@@ -1966,7 +1975,7 @@ class RelayBot(commands.Bot):
         if ENABLE_DB_BACKUPS:
             asyncio.create_task(self.database_backup_loop())
 
-        if ENABLE_RELAY_RECORD_CLEANUP or ENABLE_TRANSLATION_CACHE:
+        if ENABLE_RELAY_RECORD_CLEANUP or ENABLE_ORPHAN_RELAY_CLEANUP or ENABLE_TRANSLATION_CACHE:
             asyncio.create_task(self.database_maintenance_loop())
 
         synced = await self.tree.sync()
@@ -2687,6 +2696,87 @@ class RelayBot(commands.Bot):
 
         return int(removed or 0)
 
+    async def cleanup_orphaned_relay_messages(self) -> int:
+        """Delete mirrors whose original source message was deleted while the bot missed the event.
+
+        Normal delete-sync is instant through Discord delete events. This is a
+        safety net for cases where the bot was restarting/offline, or where a
+        delete event arrived before relay records were saved.
+        """
+        if not ENABLE_ORPHAN_RELAY_CLEANUP:
+            return 0
+
+        assert self.db is not None
+
+        grace_modifier = f"-{ORPHAN_RELAY_CLEANUP_GRACE_MINUTES} minutes"
+        cursor = await self.db.execute(
+            """
+            SELECT
+                guild_id,
+                source_channel_id,
+                source_message_id,
+                MIN(created_at) AS first_created_at
+            FROM relayed_messages
+            WHERE created_at IS NOT NULL
+              AND created_at < datetime('now', ?)
+            GROUP BY guild_id, source_channel_id, source_message_id
+            ORDER BY first_created_at DESC
+            LIMIT ?
+            """,
+            (grace_modifier, ORPHAN_RELAY_CLEANUP_BATCH_SIZE),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+        cleaned = 0
+
+        for row in rows:
+            guild_id = int(row["guild_id"])
+            source_channel_id = int(row["source_channel_id"])
+            source_message_id = int(row["source_message_id"])
+
+            channel = await resolve_text_channel(source_channel_id)
+            if channel is None:
+                continue
+
+            try:
+                await channel.fetch_message(source_message_id)
+                continue
+            except discord.NotFound:
+                pass
+            except discord.Forbidden:
+                log.warning(
+                    "Missing permission to check source message %s in channel %s for orphan cleanup.",
+                    source_message_id,
+                    source_channel_id,
+                )
+                continue
+            except discord.HTTPException as exc:
+                log.warning(
+                    "Could not check source message %s in channel %s for orphan cleanup: %s",
+                    source_message_id,
+                    source_channel_id,
+                    exc,
+                )
+                continue
+            except Exception:
+                log.exception(
+                    "Unexpected orphan cleanup check error for source message %s in channel %s.",
+                    source_message_id,
+                    source_channel_id,
+                )
+                continue
+
+            lock = await self.get_source_message_lock(guild_id, source_channel_id, source_message_id)
+            async with lock:
+                await delete_mirrored_messages(guild_id, source_channel_id, source_message_id)
+                cleaned += 1
+
+        if cleaned:
+            log.info("Cleaned up mirrored messages for %s deleted source message(s).", cleaned)
+
+        return cleaned
+
     async def prune_translation_cache(self) -> None:
         if not ENABLE_TRANSLATION_CACHE:
             return
@@ -2722,6 +2812,8 @@ class RelayBot(commands.Bot):
         intervals = []
         if ENABLE_RELAY_RECORD_CLEANUP:
             intervals.append(RELAY_RECORD_CLEANUP_INTERVAL_HOURS)
+        if ENABLE_ORPHAN_RELAY_CLEANUP:
+            intervals.append(ORPHAN_RELAY_CLEANUP_INTERVAL_HOURS)
         if ENABLE_TRANSLATION_CACHE:
             intervals.append(24.0)
 
@@ -2730,6 +2822,7 @@ class RelayBot(commands.Bot):
         while not self.is_closed():
             try:
                 await self.cleanup_old_relay_records()
+                await self.cleanup_orphaned_relay_messages()
                 await self.prune_translation_cache()
             except Exception as exc:
                 log.warning("Database maintenance failed: %s", exc)
@@ -4690,8 +4783,13 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
     if payload.guild_id is None:
         return
 
-    await delete_mirrored_messages(payload.guild_id, payload.channel_id, payload.message_id)
-    await bot.delete_relay_record_by_target_message(payload.message_id)
+    # Wait for an in-progress relay/edit of the same original message to finish.
+    # Without this, a very fast delete can arrive before relay records are saved,
+    # leaving mirrored webhook messages behind.
+    lock = await bot.get_source_message_lock(payload.guild_id, payload.channel_id, payload.message_id)
+    async with lock:
+        await delete_mirrored_messages(payload.guild_id, payload.channel_id, payload.message_id)
+        await bot.delete_relay_record_by_target_message(payload.message_id)
 
 
 @bot.event
@@ -4700,8 +4798,10 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
         return
 
     for message_id in payload.message_ids:
-        await delete_mirrored_messages(payload.guild_id, payload.channel_id, message_id)
-        await bot.delete_relay_record_by_target_message(message_id)
+        lock = await bot.get_source_message_lock(payload.guild_id, payload.channel_id, message_id)
+        async with lock:
+            await delete_mirrored_messages(payload.guild_id, payload.channel_id, message_id)
+            await bot.delete_relay_record_by_target_message(message_id)
 
 
 
