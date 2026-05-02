@@ -1334,6 +1334,111 @@ def get_message_sticker_links(message: discord.Message) -> list[str]:
 
 
 
+def get_object_or_dict_value(obj, key: str, default=None):
+    """Read an attribute from discord.py objects or a key from raw Discord dicts."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def get_url_from_discord_media(obj) -> Optional[str]:
+    """Return the best URL from attachments/embed media objects or raw dicts."""
+    for key in ("url", "proxy_url"):
+        value = get_object_or_dict_value(obj, key)
+        if value:
+            return str(value)
+    return None
+
+
+def extract_embed_media_links(embed) -> list[str]:
+    """Extract useful preview/media links from a Discord embed or raw embed dict."""
+    links: list[str] = []
+
+    direct_url = get_object_or_dict_value(embed, "url")
+    if direct_url:
+        links.append(str(direct_url))
+
+    for field_name in ("image", "thumbnail", "video"):
+        media = get_object_or_dict_value(embed, field_name)
+        if not media:
+            continue
+        media_url = get_url_from_discord_media(media)
+        if media_url:
+            links.append(media_url)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for link in links:
+        if link in seen:
+            continue
+        seen.add(link)
+        deduped.append(link)
+    return deduped
+
+
+def iter_forwarded_message_snapshots(message: discord.Message):
+    """Yield forwarded-message snapshot objects if Discord provides them.
+
+    discord.py exposes forwarded messages as message snapshots in newer builds.
+    Keep this helper flexible so it works whether snapshots are rich objects or
+    raw dict-like payloads.
+    """
+    for attr_name in ("message_snapshots", "snapshots"):
+        snapshots = getattr(message, attr_name, None)
+        if not snapshots:
+            continue
+        for snapshot in snapshots:
+            # Some wrappers expose the actual snapshot/message under .message.
+            yield get_object_or_dict_value(snapshot, "message", snapshot)
+
+
+def get_forwarded_message_parts(message: discord.Message) -> tuple[str, list[str]]:
+    """Return text/media links from Discord forwarded-message snapshots.
+
+    Webhooks cannot recreate Discord's native "Forwarded" card UI, so the bot
+    mirrors the forwarded content/media as normal translated text and links.
+    """
+    text_parts: list[str] = []
+    links: list[str] = []
+
+    for snapshot in iter_forwarded_message_snapshots(message):
+        content = get_object_or_dict_value(snapshot, "content", "") or ""
+        if content and str(content).strip():
+            text_parts.append(str(content).strip())
+
+        for attachment in get_object_or_dict_value(snapshot, "attachments", []) or []:
+            url = get_url_from_discord_media(attachment)
+            if url:
+                links.append(url)
+
+        for embed in get_object_or_dict_value(snapshot, "embeds", []) or []:
+            links.extend(extract_embed_media_links(embed))
+
+    deduped_links: list[str] = []
+    seen_links: set[str] = set()
+    for link in links:
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+        deduped_links.append(link)
+
+    return "\n\n".join(text_parts).strip(), deduped_links
+
+
+def message_has_syncable_content(message: discord.Message) -> bool:
+    """Return True if a message has content/media worth mirroring."""
+    if message.content:
+        return True
+    if message.attachments:
+        return True
+    if getattr(message, "stickers", None):
+        return True
+
+    forwarded_text, forwarded_links = get_forwarded_message_parts(message)
+    return bool(forwarded_text or forwarded_links)
+
+
+
 async def get_webhook_author_identity(message: discord.Message) -> tuple[str, str]:
     """Return the display name/avatar that webhook mirrors should use.
 
@@ -4248,6 +4353,16 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
     sticker_links = get_message_sticker_links(message)
     if sticker_links:
         attachment_links.extend(sticker_links)
+
+    forwarded_text, forwarded_links = get_forwarded_message_parts(message)
+    if forwarded_text:
+        if original_text.strip():
+            original_text = f"{original_text.rstrip()}\n\n{forwarded_text}"
+        else:
+            original_text = forwarded_text
+    if forwarded_links:
+        attachment_links.extend(forwarded_links)
+
     display_name, avatar_url = await get_webhook_author_identity(message)
     reply_context = await get_reply_context_for_message(message)
 
@@ -4524,7 +4639,13 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
     if payload.guild_id is None:
         return
 
-    if "content" not in payload.data and "attachments" not in payload.data and "stickers" not in payload.data:
+    if (
+        "content" not in payload.data
+        and "attachments" not in payload.data
+        and "stickers" not in payload.data
+        and "embeds" not in payload.data
+        and "message_snapshots" not in payload.data
+    ):
         return
 
     channel = await resolve_text_channel(payload.channel_id)
@@ -4552,7 +4673,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
         existing_rows = await bot.get_relay_records_for_source(payload.guild_id, payload.channel_id, payload.message_id)
         existing_records_by_target = group_relay_rows_by_target(existing_rows)
 
-        if not message.content and not message.attachments and not getattr(message, "stickers", None):
+        if not message_has_syncable_content(message):
             await delete_mirrored_messages(payload.guild_id, payload.channel_id, payload.message_id)
             return
 
@@ -4570,7 +4691,7 @@ async def on_message(message: discord.Message) -> None:
     if message.webhook_id is not None:
         return
 
-    if not message.content and not message.attachments and not getattr(message, "stickers", None):
+    if not message_has_syncable_content(message):
         return
 
     lock = await bot.get_source_message_lock(message.guild.id, message.channel.id, message.id)
