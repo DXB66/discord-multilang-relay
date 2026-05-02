@@ -838,6 +838,147 @@ def get_arabic_dialect_pivot_for_line(line: str) -> Optional[str]:
     return f"{prefix}{pivot}{punct}"
 
 
+# Very short Arabic messages are risky for AI translation. A single Arabic
+# letter or a short unknown one-word token is often a name, typo, or chat
+# fragment. Local AI models may hallucinate explanations for those, so keep
+# unknown short fragments unchanged. Known short chat words are handled here
+# first through a safe English pivot.
+ARABIC_SHORT_CHAT_PIVOTS: dict[str, str] = {
+    "نعم": "Yes.",
+    "ايوه": "Yes.",
+    "ايوا": "Yes.",
+    "يب": "Yes.",
+    "لا": "No.",
+    "كلا": "No.",
+    "تمام": "Okay.",
+    "تم": "Done.",
+    "اوكي": "Okay.",
+    "اوك": "Okay.",
+    "ماشي": "Okay.",
+    "شكرا": "Thank you.",
+    "شكرا لك": "Thank you.",
+    "يعطيك العافيه": "Thank you.",
+    "العفو": "You're welcome.",
+    "مرحبا": "Hello.",
+    "هلا": "Hello.",
+    "اهلا": "Hello.",
+    "السلام عليكم": "Peace be upon you.",
+    "وعليكم السلام": "Peace be upon you too.",
+    "صباح الخير": "Good morning.",
+    "مساء الخير": "Good evening.",
+    "تصبح على خير": "Good night.",
+    "وين": "Where?",
+    "فين": "Where?",
+    "مين": "Who?",
+    "منو": "Who?",
+    "متى": "When?",
+    "ليش": "Why?",
+    "ليه": "Why?",
+    "كيف": "How?",
+    "كم": "How much?",
+    "ايه": "What?",
+    "ايش": "What?",
+    "وش": "What?",
+    "هاها": "Haha.",
+    "هه": "Haha.",
+    "هههه": "Haha.",
+    "ههههه": "Haha.",
+    "هههههه": "Haha.",
+}
+
+
+def get_arabic_short_chat_pivot(text: str) -> Optional[str]:
+    """Return a safe English pivot for common very short Arabic chat messages."""
+    if not ARABIC_LETTER_RE.search(text):
+        return None
+
+    if "\n" in text or len(text.strip()) > 40:
+        return None
+
+    match = ARABIC_LINE_RE.match(text)
+    if not match:
+        return None
+
+    prefix = match.group("prefix") or ""
+    body = (match.group("body") or "").strip()
+    punct = normalize_arabic_output_punctuation(match.group("punct") or "")
+
+    if not body:
+        return None
+
+    key = normalize_arabic_for_rule_matching(body)
+    if not key:
+        return None
+
+    pivot = ARABIC_SHORT_CHAT_PIVOTS.get(key)
+
+    # Arabic laughter can be written with many repeated ه characters.
+    if pivot is None and re.fullmatch(r"ه{2,}", key):
+        pivot = "Haha."
+
+    if pivot is None:
+        return None
+
+    if punct and pivot[-1:] in ".!?":
+        return f"{prefix}{pivot}"
+    return f"{prefix}{pivot}{punct}"
+
+
+def is_arabic_ambiguous_fragment_passthrough(text: str, source_lang: str, target_lang: str) -> bool:
+    """Return True for tiny Arabic fragments that should be mirrored unchanged.
+
+    Examples: "ا", "ل..", and short one-word names such as "ايكا".
+    Translating these gives the AI too little context and can produce
+    explanations instead of translations.
+    """
+    source_base = canonical_language_code(source_lang).split("-", 1)[0]
+    target_base = canonical_language_code(target_lang).split("-", 1)[0]
+
+    if source_base != "ar" or target_base == "ar":
+        return False
+
+    cleaned = (text or "").strip()
+    if not cleaned or "\n" in cleaned:
+        return False
+
+    if not ARABIC_LETTER_RE.search(cleaned):
+        return False
+
+    # Let protected token splitting handle messages that mix mentions/URLs/emojis
+    # with Arabic text.
+    if DISCORD_PROTECTED_TOKEN_RE.search(cleaned):
+        return False
+
+    # Known Arabic chat words/phrases should still translate.
+    if get_arabic_short_chat_pivot(cleaned) is not None:
+        return False
+    if get_arabic_dialect_pivot_for_line(cleaned) is not None:
+        return False
+
+    match = ARABIC_LINE_RE.match(cleaned)
+    if not match:
+        return False
+
+    body = (match.group("body") or "").strip()
+    key = normalize_arabic_for_rule_matching(body)
+    if not key:
+        return False
+
+    words = key.split()
+    arabic_letter_count = len(ARABIC_LETTER_RE.findall(key))
+
+    # One Arabic letter, or two-letter fragments, are too ambiguous to translate.
+    if arabic_letter_count <= 2 and all(re.fullmatch(r"[\u0600-\u06FF]+", word) for word in words):
+        return True
+
+    # A single short Arabic token that is not a known word is more likely a name
+    # or fragment than a sentence. Preserve it exactly.
+    if len(words) == 1 and re.fullmatch(r"[\u0600-\u06FF]{1,6}", words[0]):
+        return True
+
+    return False
+
+
 # LibreTranslate can mistranslate very short chat phrases, especially into Korean.
 # These exact short-phrase overrides avoid broken outputs like "이름 *" for "Hi/Bye".
 SHORT_PHRASE_OVERRIDES: dict[str, dict[str, str]] = {
@@ -966,12 +1107,32 @@ AI_EXPLANATION_MARKERS = (
     "rather an emoticon",
     "not a korean text",
     "not korean text",
+    "not an arabic text",
+    "not arabic text",
     "cannot be translated",
     "can't be translated",
     "does not need translation",
     "doesn't need translation",
     "is an emoji",
     "is an emoticon",
+    "this appears to be",
+    "appears to be a name",
+    "appears to be a term",
+    "term of endearment",
+    "remains unchanged",
+    "i understand your request",
+    "please provide",
+    "provide the text",
+    "original message is missing",
+    "source message is missing",
+    "original text is missing",
+    "compreendo o seu pedido",
+    "forneça o texto",
+    "eu ficarei feliz em ajudar",
+    "我理解你的要求",
+    "请提供",
+    "原始信息似乎不见了",
+    "我很乐意提供帮助",
 )
 
 
@@ -2785,6 +2946,10 @@ class RelayBot(commands.Bot):
                     if not english_pivot:
                         raise RuntimeError("Ollama Arabic AI returned an empty translation.")
 
+                    if looks_like_ai_explanation_output(english_pivot):
+                        log.warning("Arabic AI helper returned explanation-like output; ignoring it.")
+                        return None
+
                     # Very small cache to avoid repeated Ollama calls when one
                     # source message is being relayed to many channels.
                     if len(self.arabic_ai_pivot_cache) > 256:
@@ -3501,6 +3666,18 @@ class RelayBot(commands.Bot):
         if source_norm == target_norm:
             log_translation_route("same-language", source_norm, target_norm, text)
             return text
+
+        arabic_short_chat_pivot = get_arabic_short_chat_pivot(text) if source_norm.split("-", 1)[0] == "ar" else None
+        if arabic_short_chat_pivot is not None:
+            log_translation_route("arabic-short-chat", source_norm, target_norm, text)
+            if target_norm.split("-", 1)[0] == "en":
+                return await self.remember_translation_result(text, source_norm, target_norm, arabic_short_chat_pivot)
+            translated_from_pivot = await self.translate_text(arabic_short_chat_pivot, "en", target_norm)
+            return await self.remember_translation_result(text, source_norm, target_norm, translated_from_pivot)
+
+        if is_arabic_ambiguous_fragment_passthrough(text, source_norm, target_norm):
+            log_translation_route("arabic-ambiguous-passthrough", source_norm, target_norm, text)
+            return await self.remember_translation_result(text, source_norm, target_norm, text)
 
         spanish_chat_pivot = get_spanish_chat_phrase_pivot(text) if source_norm.split("-", 1)[0] == "es" else None
         if spanish_chat_pivot is not None:
