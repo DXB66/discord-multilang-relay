@@ -1425,6 +1425,12 @@ def get_forwarded_message_parts(message: discord.Message) -> tuple[str, list[str
     return "\n\n".join(text_parts).strip(), deduped_links
 
 
+def message_has_forwarded_content(message: discord.Message) -> bool:
+    """Return True when a message contains Discord forwarded-message snapshots."""
+    forwarded_text, forwarded_links = get_forwarded_message_parts(message)
+    return bool(forwarded_text or forwarded_links)
+
+
 def message_has_syncable_content(message: discord.Message) -> bool:
     """Return True if a message has content/media worth mirroring."""
     if message.content:
@@ -1504,6 +1510,13 @@ def get_message_reply_preview(message: discord.Message) -> str:
 async def get_reply_context_for_message(message: discord.Message) -> Optional[dict[str, str]]:
     """Return author/text preview for a replied-to message, if any."""
     if not ENABLE_REPLY_CONTEXT:
+        return None
+
+    # Discord forwarded messages can expose a reference/snapshot that looks like
+    # a reply to the bot. Do not build reply context for forwarded messages,
+    # otherwise the forwarded text appears once in the quote and once as the
+    # actual mirrored message.
+    if message_has_forwarded_content(message):
         return None
 
     reference = getattr(message, "reference", None)
@@ -4226,6 +4239,7 @@ async def relay_to_target(
     existing_message_ids: Optional[list[int]] = None,
     pretranslated_text: Optional[str] = None,
     reply_context: Optional[dict[str, str]] = None,
+    is_forwarded_message: bool = False,
 ) -> tuple[int, list[int]] | None:
     if message.guild is None:
         return None
@@ -4273,6 +4287,10 @@ async def relay_to_target(
         if final_content:
             final_content += "\n\n"
         final_content += "\n".join(attachment_links)
+
+    if is_forwarded_message:
+        forwarded_prefix = "> ↪ Forwarded\n\n"
+        final_content = f"{forwarded_prefix}{final_content}".strip()
 
     reply_prefix = await build_reply_context_prefix(
         reply_context,
@@ -4355,6 +4373,7 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
         attachment_links.extend(sticker_links)
 
     forwarded_text, forwarded_links = get_forwarded_message_parts(message)
+    is_forwarded_message = bool(forwarded_text or forwarded_links)
     if forwarded_text:
         if original_text.strip():
             original_text = f"{original_text.rstrip()}\n\n{forwarded_text}"
@@ -4364,7 +4383,7 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
         attachment_links.extend(forwarded_links)
 
     display_name, avatar_url = await get_webhook_author_identity(message)
-    reply_context = await get_reply_context_for_message(message)
+    reply_context = None if is_forwarded_message else await get_reply_context_for_message(message)
 
     if ENFORCE_SOURCE_LANGUAGE and original_text.strip():
         try:
@@ -4440,6 +4459,7 @@ async def sync_linked_message(message: discord.Message, existing_records_by_targ
                 existing_message_ids=existing_records_by_target.get(target["channel_id"]),
                 pretranslated_text=pretranslated_by_channel.get(target["channel_id"]),
                 reply_context=reply_context,
+                is_forwarded_message=is_forwarded_message,
             )
 
     results = await asyncio.gather(*(run_relay(target) for target in relay_targets), return_exceptions=True)
