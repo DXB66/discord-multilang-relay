@@ -1146,7 +1146,7 @@ AI_EXPLANATION_MARKERS = (
 
 
 def looks_like_ai_explanation_output(text: str) -> bool:
-    """Detect AI commentary that should never be mirrored into Discord."""
+    # Detect AI commentary that should never be mirrored into Discord.
     cleaned = " ".join((text or "").strip().split())
     if not cleaned:
         return False
@@ -1154,6 +1154,29 @@ def looks_like_ai_explanation_output(text: str) -> bool:
     lowered = cleaned.lower()
 
     if any(marker in lowered for marker in AI_EXPLANATION_MARKERS):
+        return True
+
+    # Catch label/template output in English and Korean, for example:
+    # "Original message:", "Translated message:", "원본 메시지:", "번역된 메시지:".
+    # These usually mean the model answered like an assistant instead of acting
+    # as a pure translation engine.
+    if re.search(
+        r"(?im)(^|\n)\s*(?:"
+        r"original\s+message|translated\s+message|source\s+message|source\s+text|"
+        r"input\s+message|output\s+message|translation|translated\s+text|"
+        r"원본\s*메시지|번역된\s*메시지|번역\s*메시지"
+        r")\s*[:：]",
+        text or "",
+    ):
+        return True
+
+    # If the model repeats assistant-style labels in one answer, reject it.
+    label_hits = len(re.findall(
+        r"(?i)(original\s+message|translated\s+message|source\s+text|translated\s+text|"
+        r"원본\s*메시지|번역된\s*메시지)",
+        text or "",
+    ))
+    if label_hits >= 1:
         return True
 
     # Extra guard for parenthesized AI explanations.
@@ -2879,6 +2902,10 @@ class RelayBot(commands.Bot):
             log.warning("Skipped caching translation artifact output for %s -> %s.", source_lang, target_lang)
             return
 
+        if looks_like_ai_explanation_output(cleaned_translation):
+            log.warning("Skipped caching explanation-like translation output for %s -> %s.", source_lang, target_lang)
+            return
+
         assert self.db is not None
 
         source_norm = canonical_language_code(source_lang)
@@ -2964,6 +2991,8 @@ class RelayBot(commands.Bot):
             r"^translation\s*:\s*",
             r"^english\s*translation\s*:\s*",
             r"^translated\s*text\s*:\s*",
+            r"^korean\s*translation\s*:\s*",
+            r"^번역\s*[:：]\s*",
         )
         for pattern in label_patterns:
             cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
@@ -3144,9 +3173,16 @@ class RelayBot(commands.Bot):
             assert self.http_session is not None
 
             prompt = (
-                "You are a professional Discord chat translator. "
-                f"{prompt_task}\n\n"
-                f"{cleaned_text}"
+                "You are a strict translation engine for Discord chat. "
+                f"{prompt_task}\n"
+                "Rules: Output only the translated message. "
+                "Do not add greetings, labels, examples, notes, explanations, or sections. "
+                "Do not write 'Original message', 'Translated message', '원본 메시지', or '번역된 메시지'. "
+                "Do not answer the message; only translate it. "
+                "Translate only the content between <message> and </message>.\n\n"
+                "<message>\n"
+                f"{cleaned_text}\n"
+                "</message>"
             )
 
             payload = {
