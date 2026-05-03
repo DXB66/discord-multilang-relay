@@ -3104,6 +3104,113 @@ class RelayBot(commands.Bot):
 
         return await self.translate_text(english_pivot, "en", target_norm)
 
+
+    async def translate_to_arabic_with_ai_if_needed(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
+        """Use local Aya/Ollama for non-Arabic -> Arabic target translations.
+
+        LibreTranslate can leave English fragments untranslated when a message is
+        split around protected Discord tokens such as emoji or mentions. This
+        method translates the whole message to Arabic first, while protecting
+        Discord tokens with placeholders and restoring them afterwards.
+        """
+        if not ENABLE_ARABIC_AI_TRANSLATION:
+            return None
+
+        source_base = canonical_language_code(source_norm).split("-", 1)[0]
+        target_base = canonical_language_code(target_norm).split("-", 1)[0]
+
+        if target_base != "ar" or source_base == "ar":
+            return None
+
+        # Korean source has its own stronger Korean -> English pivot path.
+        if source_base == "ko" or KOREAN_LETTER_RE.search(text):
+            return None
+
+        cleaned_text = text.strip()
+        if not cleaned_text:
+            return None
+
+        # Avoid asking the Arabic AI to translate Arabic fragments again.
+        if ARABIC_LETTER_RE.search(cleaned_text):
+            return None
+
+        if len(cleaned_text) > ARABIC_AI_MAX_CHARS:
+            log.info(
+                "Target Arabic AI helper skipped message because it is too long (%s > %s chars).",
+                len(cleaned_text),
+                ARABIC_AI_MAX_CHARS,
+            )
+            return None
+
+        placeholders: dict[str, str] = {}
+
+        def protect_match(match: re.Match) -> str:
+            placeholder = f"__WOS_TOKEN_{len(placeholders)}__"
+            placeholders[placeholder] = match.group(0)
+            return placeholder
+
+        protected_text = DISCORD_PROTECTED_TOKEN_RE.sub(protect_match, cleaned_text)
+
+        source_name = language_display_name(source_norm)
+        prompt = (
+            "You are a professional Discord chat translator. "
+            f"Translate this {source_name} Discord chat message into natural Arabic. "
+            "Preserve line breaks. Preserve names and numbers. "
+            "Keep every placeholder exactly unchanged, such as __WOS_TOKEN_0__. "
+            "Do not leave normal English words untranslated. "
+            "Return only the Arabic translation with no explanation, no labels, and no quotes.\n\n"
+            f"{protected_text}"
+        )
+
+        assert self.http_session is not None
+
+        payload = {
+            "model": ARABIC_AI_MODEL,
+            "stream": False,
+            "keep_alive": ARABIC_AI_KEEP_ALIVE,
+            "options": {
+                "temperature": 0,
+                "num_predict": ARABIC_AI_NUM_PREDICT,
+            },
+            "prompt": prompt,
+        }
+
+        timeout = aiohttp.ClientTimeout(total=ARABIC_AI_TIMEOUT)
+
+        try:
+            async with self.http_session.post(ARABIC_AI_URL, json=payload, timeout=timeout) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"Ollama target Arabic AI error {response.status}: {body}")
+
+                data = await response.json()
+                response_text = data.get("response")
+                if not response_text:
+                    raise RuntimeError(f"Unexpected Ollama target Arabic AI response: {data}")
+
+                translated = self.clean_arabic_ai_response(str(response_text))
+                if not translated:
+                    raise RuntimeError("Ollama target Arabic AI returned an empty translation.")
+
+                if looks_like_ai_explanation_output(translated):
+                    log.warning("Target Arabic AI helper returned explanation-like output; ignoring it.")
+                    return None
+
+                for placeholder, original_token in placeholders.items():
+                    if placeholder not in translated:
+                        log.warning(
+                            "Target Arabic AI helper dropped protected placeholder %s; falling back.",
+                            placeholder,
+                        )
+                        return None
+                    translated = translated.replace(placeholder, wrap_protected_token_for_target(original_token, target_norm))
+
+                return normalize_translated_output_for_target(translated, target_norm)
+        except Exception as exc:
+            log.warning("Target Arabic AI helper failed; falling back to LibreTranslate. Error: %s", exc)
+            return None
+
+
     async def get_korean_ai_translation(self, text: str, source_norm: str, target_norm: str) -> Optional[str]:
         """Use local Ollama/Aya for Korean-related translation.
 
@@ -3864,6 +3971,12 @@ class RelayBot(commands.Bot):
         if short_override is not None:
             log_translation_route("short-phrase", source_norm, target_norm, text)
             return await self.remember_translation_result(text, source_norm, target_norm, short_override)
+
+
+        target_arabic_ai_translation = await self.translate_to_arabic_with_ai_if_needed(text, source_norm, target_norm)
+        if target_arabic_ai_translation is not None:
+            log_translation_route("target-arabic-ai", source_norm, target_norm, text)
+            return await self.remember_translation_result(text, source_norm, target_norm, target_arabic_ai_translation)
 
         # Preserve Discord custom emojis/mentions/timestamps by translating only
         # the normal text around them, then putting the original token back.
