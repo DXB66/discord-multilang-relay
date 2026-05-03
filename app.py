@@ -1278,6 +1278,9 @@ def looks_like_ai_explanation_output(text: str) -> bool:
     if not cleaned:
         return False
 
+    if "WOS_TOKEN_" in (text or ""):
+        return True
+
     lowered = cleaned.lower()
 
     if any(marker in lowered for marker in AI_EXPLANATION_MARKERS):
@@ -1544,6 +1547,48 @@ def looks_like_spanish_latin_text(text: str) -> bool:
     # Require a few Spanish function words, or accented Spanish punctuation.
     return spanish_hits >= 3 or (accented_spanish and spanish_hits >= 1)
 
+
+# WOS/game abbreviations that players usually expect to stay exactly as typed.
+# Very short all-caps game terms give AI models too little context and can cause
+# prompt/example hallucinations, especially in the Arabic target helper.
+WOS_ABBREVIATION_PASSTHROUGH = {
+    "FDT",  # Frostdragon Tyrant shorthand used by players
+    "SVS",
+    "KE",
+    "CJ",   # Crazy Joe shorthand
+    "NAP",
+    "FC",
+    "R1", "R2", "R3", "R4", "R5",
+    "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11",
+}
+
+WOS_ABBREVIATION_EDGE_PUNCT = " \t\r\n.,!?؟،;:()[]{}<>\"'“”‘’`"
+
+
+def is_wos_short_abbreviation_passthrough(text: str) -> bool:
+    """Return True for standalone WOS abbreviations that should not be translated.
+
+    Example: "FDT" should stay "FDT" in every linked channel, not become a long
+    explanation or glossary example.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned or "\n" in cleaned:
+        return False
+
+    body = cleaned.strip(WOS_ABBREVIATION_EDGE_PUNCT)
+    if not body:
+        return False
+
+    # Only preserve standalone short game abbreviations, not full sentences.
+    if " " in body or "\t" in body:
+        return False
+
+    key = body.upper()
+    if key not in WOS_ABBREVIATION_PASSTHROUGH:
+        return False
+
+    # Keep original punctuation/casing exactly as user typed.
+    return True
 
 def should_try_mixed_language_detection(text: str, source_lang: str) -> bool:
     """Avoid expensive detection unless the line could be the wrong Latin language."""
@@ -4007,6 +4052,10 @@ class RelayBot(commands.Bot):
 
         if is_non_language_passthrough_text(text):
             log_translation_route("non-language-passthrough", source_norm, target_norm, text)
+            return text
+
+        if is_wos_short_abbreviation_passthrough(text):
+            log_translation_route("wos-abbreviation-passthrough", source_norm, target_norm, text)
             return text
 
         mixed_line_translation = await self.translate_mixed_language_lines_if_needed(text, source_norm, target_norm)
