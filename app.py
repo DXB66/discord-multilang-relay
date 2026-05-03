@@ -251,6 +251,133 @@ def normalize_translated_output_for_target(text: str, target_lang: str) -> str:
 
     return normalize_hashtag_spacing(text)
 
+# Whiteout Survival / WOS game glossary.
+# These terms are game context, not normal dictionary words. Keeping them stable
+# prevents mistakes such as Arabic "الفرن" becoming "oven" instead of "Furnace".
+WOS_AI_GLOSSARY_INSTRUCTION = (
+    "Whiteout Survival game glossary: "
+    "Furnace = الفرن. Do not translate Furnace as oven. "
+    "Foundry Battle = معركة المسبك. Foundry = المسبك. "
+    "There is no official event called Furnace Battle; if Arabic says معركة الفرن, "
+    "translate it as 'battle for the Furnace' or 'Furnace fight', not as an official event title. "
+    "Keep UTC times exactly as written, such as 19 UTC; do not convert them to 7 PM UTC. "
+    "Recognize these WOS terms: SvS/State of Power, Sunfire Castle, Foundry Battle, Bear Hunt, "
+    "Crazy Joe, Fortress Battle, Frostfire Mine, Frostdragon Tyrant, Canyon Clash, "
+    "Alliance Championship, Alliance Showdown, Alliance Mobilization, Mercenary Prestige, "
+    "Tundra Trading Station, Tundra Arms League, Daybreak Expedition, Chief, R4, R5, rally, "
+    "garrison, shield, teleport, infirmary, troops, wounded, state, alliance. "
+)
+
+
+def _original_text_has_arabic_furnace(original_text: str) -> bool:
+    # Matches فرن / الفرن / بالفرن etc. Do not treat Foundry as Furnace.
+    return re.search(r"(?<![\u0600-\u06FF])(?:ب?ال)?فرن(?![\u0600-\u06FF])", original_text or "") is not None
+
+
+def _original_text_has_arabic_foundry(original_text: str) -> bool:
+    return re.search(r"(?<![\u0600-\u06FF])(?:معركة\s+)?(?:ال)?مسبك|(?:معركة\s+)?(?:ال)?مسبك", original_text or "") is not None
+
+
+def _preserve_original_utc_times(original_text: str, translated_text: str) -> str:
+    # Keep WOS callout times like 19 UTC instead of changing them to 7 PM UTC.
+    if not original_text or not translated_text:
+        return translated_text
+
+    original_times: list[str] = []
+    for match in re.finditer(r"\b([01]?\d|2[0-3])(?::([0-5]\d))?\s*(?:توقيت\s*)?UTC\b", original_text, re.IGNORECASE):
+        hour = str(int(match.group(1)))
+        minute = match.group(2)
+        original_times.append(f"{hour}:{minute} UTC" if minute else f"{hour} UTC")
+
+    if not original_times:
+        return translated_text
+
+    converted_time_re = re.compile(r"\b(?:1[0-2]|0?[1-9])(?::[0-5]\d)?\s*(?:AM|PM|a\.m\.|p\.m\.)\s*UTC\b", re.IGNORECASE)
+    index = 0
+
+    def repl(_match: re.Match) -> str:
+        nonlocal index
+        if index >= len(original_times):
+            return _match.group(0)
+        value = original_times[index]
+        index += 1
+        return value
+
+    return converted_time_re.sub(repl, translated_text, count=len(original_times))
+
+
+def apply_wos_glossary_to_translation(
+    original_text: str,
+    source_lang: str,
+    target_lang: str,
+    translated_text: str,
+) -> str:
+    # Apply deterministic WOS glossary fixes after an engine translates.
+    if not translated_text:
+        return translated_text
+
+    fixed = translated_text
+    try:
+        source_base = canonical_language_code(source_lang).split("-", 1)[0]
+        target_base = canonical_language_code(target_lang).split("-", 1)[0]
+    except Exception:
+        source_base = str(source_lang).split("-", 1)[0].lower()
+        target_base = str(target_lang).split("-", 1)[0].lower()
+
+    fixed = _preserve_original_utc_times(original_text, fixed)
+    original_lower = (original_text or "").lower()
+
+    if source_base == "ar" and _original_text_has_arabic_furnace(original_text):
+        if target_base == "en":
+            fixed = re.sub(r"\bthe\s+battle\s+of\s+the\s+oven\b", "the battle for the Furnace", fixed, flags=re.IGNORECASE)
+            fixed = re.sub(r"\bbattle\s+of\s+the\s+oven\b", "battle for the Furnace", fixed, flags=re.IGNORECASE)
+            fixed = re.sub(r"\bthe\s+oven\b", "the Furnace", fixed, flags=re.IGNORECASE)
+            fixed = re.sub(r"\boven\b", "Furnace", fixed, flags=re.IGNORECASE)
+            fixed = re.sub(r"\bFurnace\s+Battle\b", "battle for the Furnace", fixed)
+        else:
+            oven_words = (
+                r"oven|forno|horno|four|ofen|fırın|firin|piekarnik|piec|духовк[а-я]*|печ[ьи]|"
+                r"烤箱|烤爐|오븐"
+            )
+            fixed = re.sub(rf"\b(?:the\s+)?(?:{oven_words})\b", "Furnace", fixed, flags=re.IGNORECASE)
+
+    if source_base == "ar" and _original_text_has_arabic_foundry(original_text):
+        if target_base == "en":
+            fixed = re.sub(r"\bfoundry\s+battle\b", "Foundry Battle", fixed, flags=re.IGNORECASE)
+            fixed = re.sub(r"\bfoundry\b", "Foundry", fixed, flags=re.IGNORECASE)
+
+    if target_base == "ar":
+        if re.search(r"\bfoundry\s+battle\b", original_lower, flags=re.IGNORECASE):
+            fixed = re.sub(r"Foundry\s+Battle|معركة\s+فاوندري|معركة\s+المصنع|معركة\s+المسبك", "معركة المسبك", fixed, flags=re.IGNORECASE)
+        if re.search(r"\bfurnace\b", original_lower, flags=re.IGNORECASE):
+            fixed = re.sub(r"\bFurnace\b|الفرناس|الفورناس", "الفرن", fixed, flags=re.IGNORECASE)
+
+    english_terms = {
+        "svs": "SvS",
+        "state of power": "State of Power",
+        "sunfire castle": "Sunfire Castle",
+        "foundry battle": "Foundry Battle",
+        "bear hunt": "Bear Hunt",
+        "crazy joe": "Crazy Joe",
+        "fortress battle": "Fortress Battle",
+        "frostfire mine": "Frostfire Mine",
+        "frostdragon tyrant": "Frostdragon Tyrant",
+        "canyon clash": "Canyon Clash",
+        "alliance championship": "Alliance Championship",
+        "alliance showdown": "Alliance Showdown",
+        "alliance mobilization": "Alliance Mobilization",
+        "mercenary prestige": "Mercenary Prestige",
+        "tundra trading station": "Tundra Trading Station",
+        "tundra arms league": "Tundra Arms League",
+        "daybreak expedition": "Daybreak Expedition",
+    }
+    if target_base == "en":
+        for term_lower, proper in english_terms.items():
+            if term_lower in original_lower:
+                fixed = re.sub(rf"\b{re.escape(term_lower)}\b", proper, fixed, flags=re.IGNORECASE)
+
+    return fixed
+
 
 CHAT_SLANG_REPLACEMENTS: dict[str, str] = {
     "u": "you",
@@ -2959,6 +3086,7 @@ class RelayBot(commands.Bot):
     ) -> str:
         cleaned = clean_translation_engine_artifacts(translated_text)
         normalized = normalize_translated_output_for_target(cleaned, target_lang)
+        normalized = apply_wos_glossary_to_translation(original_text, source_lang, target_lang, normalized)
 
         missing_hashes = missing_hashtag_tokens(original_text, normalized)
         if missing_hashes:
@@ -3035,8 +3163,9 @@ class RelayBot(commands.Bot):
                 "You are a professional Arabic dialect translator for Discord chat. "
                 "Translate the Arabic message into natural English. Understand Egyptian Arabic, "
                 "Gulf Arabic, UAE Arabic, Levantine Arabic, and casual slang. Preserve line breaks. "
-                "Preserve names, mentions, links, numbers, and emoji text. Return only the English "
-                "translation with no explanation.\n\n"
+                "Preserve names, mentions, links, numbers, and emoji text. "
+                + WOS_AI_GLOSSARY_INSTRUCTION + " "
+                "Return only the English translation with no explanation.\n\n"
                 f"{cleaned_text}"
             )
 
@@ -3071,6 +3200,8 @@ class RelayBot(commands.Bot):
                     if looks_like_ai_explanation_output(english_pivot):
                         log.warning("Arabic AI helper returned explanation-like output; ignoring it.")
                         return None
+
+                    english_pivot = apply_wos_glossary_to_translation(cleaned_text, "ar", "en", english_pivot)
 
                     # Very small cache to avoid repeated Ollama calls when one
                     # source message is being relayed to many channels.
@@ -3157,6 +3288,7 @@ class RelayBot(commands.Bot):
             f"Translate this {source_name} Discord chat message into natural Arabic. "
             "Preserve line breaks. Preserve names and numbers. "
             "Keep every placeholder exactly unchanged, such as __WOS_TOKEN_0__. "
+            + WOS_AI_GLOSSARY_INSTRUCTION + " "
             "Do not leave normal English words untranslated. "
             "Return only the Arabic translation with no explanation, no labels, and no quotes.\n\n"
             f"{protected_text}"
@@ -3205,7 +3337,8 @@ class RelayBot(commands.Bot):
                         return None
                     translated = translated.replace(placeholder, wrap_protected_token_for_target(original_token, target_norm))
 
-                return normalize_translated_output_for_target(translated, target_norm)
+                translated = normalize_translated_output_for_target(translated, target_norm)
+                return apply_wos_glossary_to_translation(cleaned_text, source_norm, target_norm, translated)
         except Exception as exc:
             log.warning("Target Arabic AI helper failed; falling back to LibreTranslate. Error: %s", exc)
             return None
@@ -3957,10 +4090,11 @@ class RelayBot(commands.Bot):
                 )
             else:
                 log_translation_route("persistent-cache", source_norm, target_norm, text)
-                return normalize_translated_output_for_target(
+                cached_normalized = normalize_translated_output_for_target(
                     clean_translation_engine_artifacts(cached_translation),
                     target_norm,
                 )
+                return apply_wos_glossary_to_translation(text, source_norm, target_norm, cached_normalized)
 
         common_translation = get_common_phrase_translation(text, source_norm, target_norm)
         if common_translation is not None:
